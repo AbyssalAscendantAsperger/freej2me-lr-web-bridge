@@ -1,8 +1,31 @@
+/******************************************************************************
+ * FreeJ2ME Headless Core Server - for-dev reference build
+ *
+ * This file is intentionally based on the latest proven bridge server, but the
+ * recommended headless integration contract is documented in docs/PROTOCOL.md.
+ *
+ * For a pure backend integration, use server/server.js at root kit or adapt the
+ * EmulatorSession class from this file. The built-in UI route can be ignored or
+ * hidden behind a private path; dev apps normally call REST + WebSocket.
+ *****************************************************************************/
 
+/******************************************************************************
+ * FreeJ2ME-Plus Web Bridge - V10 Multi-user Login + Per-user Save + Performance
+ *
+ * V10 includes:
+ * - V9-style performance: per-client latest-frame rendering patch, lower logging,
+ *   per-session backpressure dropping, no duplicate frame skipping by default.
+ * - JSON DB login/register/logout.
+ * - One emulator process per logged-in user/game session.
+ * - Per-user/per-game dataDir: freej2me_data/users/<userId>/games/<sha1>/runtime
+ * - AudioPipe v2/v2-debug support through stderr FJ2A packets.
+ *
+ * Drop this file over server.js.
+ *****************************************************************************/
 
 const fs = require('fs');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
@@ -70,52 +93,12 @@ function loadConfig() {
     return String(v) !== '0' && String(v).toLowerCase() !== 'false';
   }
 
-  function normalizeJavaCandidate(candidate) {
-    if (!candidate) return null;
-    const resolved = resolvePath(candidate);
-    try {
-      if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-        const exe = process.platform === 'win32' ? 'java.exe' : 'java';
-        const inBin = path.join(resolved, 'bin', exe);
-        if (fs.existsSync(inBin)) return inBin;
-        const direct = path.join(resolved, exe);
-        if (fs.existsSync(direct)) return direct;
-      }
-    } catch (e) {}
-    return resolved;
-  }
-
-  function findJavaInPath() {
-    const cmd = process.platform === 'win32' ? 'where' : 'which';
-    try {
-      const r = spawnSync(cmd, ['java'], { encoding: 'utf8', windowsHide: true });
-      if (r.status === 0 && r.stdout) {
-        const first = r.stdout.split(/\r?\n/).map(x => x.trim()).filter(Boolean)[0];
-        if (first) return first;
-      }
-    } catch (e) {}
-    return process.platform === 'win32' ? 'java.exe' : 'java';
-  }
-
   function resolveJavaPath() {
-    // Priority:
-    // 1. JAVA_PATH env: can be executable OR JDK/JRE home directory.
-    // 2. config.json javaPath: can be executable OR JDK/JRE home directory.
-    // 3. JAVA_HOME env.
-    // 4. PATH lookup (which java / where java).
-    const envJava = normalizeJavaCandidate(process.env.JAVA_PATH);
-    if (envJava) return envJava;
-
-    const configured = normalizeJavaCandidate(fileConfig.javaPath);
-    if (configured) {
-      // Linux cannot run bundled Windows java.exe. Fall through to JAVA_HOME/PATH.
-      if (!(process.platform !== 'win32' && configured.toLowerCase().endsWith('.exe'))) return configured;
-    }
-
-    const javaHome = normalizeJavaCandidate(process.env.JAVA_HOME);
-    if (javaHome) return javaHome;
-
-    return findJavaInPath();
+    if (process.env.JAVA_PATH) return resolvePath(process.env.JAVA_PATH);
+    const configured = resolvePath(fileConfig.javaPath);
+    if (process.platform === 'win32') return configured || 'java.exe';
+    if (configured && !configured.toLowerCase().endsWith('.exe') && fs.existsSync(configured)) return configured;
+    return 'java';
   }
 
   const targetFps = intConfig('TARGET_FPS', fileConfig.targetFps ?? fileConfig.maxFps, 30);
@@ -162,6 +145,7 @@ if (!['rgba', 'rgb565', 'rgb332'].includes(CONFIG.videoCodec)) {
 const AUDIO_MAGIC = Buffer.from('FJ2A');
 let wss = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
+const headlessInstances = new Map(); // instanceId -> EmulatorSession, for /api/instances + /ws/:id
 
 // =================== UTILS ===================
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
@@ -191,31 +175,8 @@ function shouldCheckExecutablePath(cmd) {
   if (!cmd || cmd === 'java' || cmd === 'java.exe') return false;
   return path.isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\');
 }
-function parseJavaMajor(versionText) {
-  // Handles: 1.8.0_x, 8, 11.0.x, 17.0.x
-  const text = String(versionText || '');
-  let m = text.match(/version\s+"(\d+)\.(\d+)/i);
-  if (m) {
-    const first = parseInt(m[1], 10);
-    const second = parseInt(m[2], 10);
-    return first === 1 ? second : first;
-  }
-  m = text.match(/openjdk\s+(\d+)/i) || text.match(/java\s+(\d+)/i);
-  return m ? parseInt(m[1], 10) : 0;
-}
-
-function checkJavaVersion() {
-  const r = spawnSync(CONFIG.javaPath, ['-version'], { encoding: 'utf8', windowsHide: true });
-  const text = `${r.stdout || ''}\n${r.stderr || ''}`;
-  if (r.error) throw new Error(`Không chạy được Java: ${CONFIG.javaPath} (${r.error.message})`);
-  const major = parseJavaMajor(text);
-  if (!major || major < 8) throw new Error(`Java version phải >= 8. Output: ${text.trim()}`);
-  console.log(`[Runtime] Java version OK: ${major}`);
-}
-
 function validateRuntimePaths() {
   if (shouldCheckExecutablePath(CONFIG.javaPath) && !fs.existsSync(CONFIG.javaPath)) throw new Error(`Không tìm thấy Java executable: ${CONFIG.javaPath}`);
-  checkJavaVersion();
   if (!fs.existsSync(CONFIG.freej2meJar)) throw new Error(`Không tìm thấy freej2me-lr.jar: ${CONFIG.freej2meJar}`);
   const st = fs.statSync(CONFIG.freej2meJar);
   if (st.isDirectory()) throw new Error(`freej2meJar đang trỏ tới THƯ MỤC: ${CONFIG.freej2meJar}`);
@@ -224,7 +185,6 @@ function validateRuntimePaths() {
     if (head.includes('git-lfs.github.com/spec')) throw new Error(`File ${CONFIG.freej2meJar} đang là Git LFS pointer. Chạy git lfs pull.`);
   }
 }
-
 
 // =================== JSON DB AUTH ===================
 class JsonDB {
@@ -358,9 +318,7 @@ class EmulatorSession {
   broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }); }
 
   addClient(ws) {
-    this.touch();
-    detachClientFromOtherSessions(ws, this);
-    this.clients.add(ws);
+    this.touch(); this.clients.add(ws);
     ws._emuSession = this;
     ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash }));
     ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }));
@@ -585,27 +543,6 @@ function getActiveSessionForUser(userId) {
   for (const sess of emulatorSessions.values()) if (sess.userId === userId && (!best || sess.lastActivity > best.lastActivity)) best = sess;
   return best;
 }
-
-function detachClientFromOtherSessions(ws, keepSession) {
-  for (const sess of emulatorSessions.values()) {
-    if (sess !== keepSession && sess.clients && sess.clients.has(ws)) sess.clients.delete(ws);
-  }
-}
-
-function stopOtherSessionsForUser(userId, keepKey = null) {
-  for (const [key, sess] of Array.from(emulatorSessions.entries())) {
-    if (sess.userId === userId && key !== keepKey) {
-      console.log(`[SESSION] stop old session user=${sess.username} game=${sess.gameHash}`);
-      // Detach sockets first so old emulator can no longer broadcast stale frames to web.
-      for (const ws of Array.from(sess.clients)) {
-        sess.clients.delete(ws);
-        if (ws._emuSession === sess) ws._emuSession = null;
-      }
-      sess.cleanupProcess();
-      emulatorSessions.delete(key);
-    }
-  }
-}
 function cleanupIdleSessions() {
   const t = now();
   for (const [key, sess] of emulatorSessions.entries()) {
@@ -620,79 +557,13 @@ function getPatchedIndexHtml() {
   let html = fs.readFileSync(indexPath, 'utf8');
 
   const loginBox = `
-  <style id="v16-ui-style">
-    body.v16-login-mode {
-      background:
-        radial-gradient(circle at 20% 15%, rgba(72, 187, 120, .18), transparent 28%),
-        radial-gradient(circle at 85% 10%, rgba(66, 153, 225, .16), transparent 30%),
-        linear-gradient(180deg, #0b1117 0%, #111 70%);
-    }
-    #login-box.v16-card {
-      width: min(560px, calc(100vw - 24px));
-      margin: 18px auto 16px;
-      padding: 22px;
-      border-radius: 18px;
-      background: rgba(22, 28, 36, .92);
-      border: 1px solid rgba(255,255,255,.10);
-      box-shadow: 0 18px 60px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
-      backdrop-filter: blur(10px);
-      text-align: left;
-    }
-    .v16-brand { display:flex; gap:14px; align-items:center; margin-bottom:14px; }
-    .v16-logo {
-      width:52px; height:52px; border-radius:16px;
-      background: linear-gradient(135deg, #28d17c, #1593ff);
-      display:grid; place-items:center; font-weight:900; color:#06110b;
-      box-shadow: 0 10px 30px rgba(40,209,124,.25);
-    }
-    .v16-title { font-size:22px; font-weight:800; color:#fff; line-height:1.1; }
-    .v16-subtitle { color:#9fb0c2; font-size:13px; margin-top:4px; }
-    .v16-form { display:grid; gap:10px; margin-top:16px; }
-    .v16-row { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
-    #login-box input {
-      width:100%; padding:12px 13px; border-radius:12px;
-      border:1px solid rgba(255,255,255,.12); outline:none;
-      background:#0b1117; color:#fff; font-size:15px;
-    }
-    #login-box input:focus { border-color:#28d17c; box-shadow:0 0 0 3px rgba(40,209,124,.14); }
-    .v16-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
-    #login-box button {
-      padding:11px 14px; border:0; border-radius:12px; cursor:pointer;
-      color:#fff; font-weight:700; transition: transform .08s, filter .15s;
-    }
-    #login-box button:active { transform: translateY(1px); }
-    #btn-login { background:linear-gradient(135deg,#15a85a,#24c875) !important; }
-    #btn-register { background:#263241 !important; }
-    #btn-logout { background:#812323 !important; }
-    .v16-hint { color:#8fa0b2; font-size:12px; margin-top:12px; line-height:1.5; }
-    #status { margin-top:10px; }
-    #upload-area {
-      border:1px solid rgba(255,255,255,.10);
-      box-shadow:0 10px 36px rgba(0,0,0,.25);
-    }
-    @media (max-width:560px) { .v16-row { grid-template-columns:1fr; } #login-box.v16-card{padding:16px;} }
-  </style>
-  <div id="login-box" class="v16-card">
-    <div class="v16-brand">
-      <div class="v16-logo">J2ME</div>
-      <div>
-        <div class="v16-title">FreeJ2ME Web Cloud</div>
-        <div class="v16-subtitle">Đăng nhập để tạo máy ảo, lưu save riêng và chơi game Java trên web.</div>
-      </div>
-    </div>
-    <div id="me-label" class="v16-subtitle">Vui lòng đăng nhập hoặc đăng ký để bắt đầu</div>
-    <div class="v16-form">
-      <div class="v16-row">
-        <input id="login-user" placeholder="Tên đăng nhập" autocomplete="username">
-        <input id="login-pass" placeholder="Mật khẩu" type="password" autocomplete="current-password">
-      </div>
-      <div class="v16-actions">
-        <button id="btn-login">Đăng nhập</button>
-        <button id="btn-register">Tạo tài khoản</button>
-        <button id="btn-logout" style="display:none">Đăng xuất</button>
-      </div>
-    </div>
-    <div class="v16-hint">Mỗi tài khoản có save riêng theo từng game. Bạn có thể upload JAR sau khi đăng nhập.</div>
+  <div id="login-box" style="margin-bottom:10px;padding:10px;background:#252525;border-radius:8px;max-width:600px;width:100%;text-align:center">
+    <span id="me-label">Chưa đăng nhập</span>
+    <input id="login-user" placeholder="username" style="margin-left:8px;padding:6px;border-radius:5px;border:1px solid #555;background:#111;color:#fff">
+    <input id="login-pass" placeholder="password" type="password" style="padding:6px;border-radius:5px;border:1px solid #555;background:#111;color:#fff">
+    <button id="btn-login" style="padding:7px 10px;border:0;border-radius:5px;background:#0d5c0d;color:#fff">Login</button>
+    <button id="btn-register" style="padding:7px 10px;border:0;border-radius:5px;background:#333;color:#fff">Register</button>
+    <button id="btn-logout" style="padding:7px 10px;border:0;border-radius:5px;background:#5c0d0d;color:#fff;display:none">Logout</button>
   </div>`;
   html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
 
@@ -732,7 +603,6 @@ function getPatchedIndexHtml() {
       if (controlsEl) controlsEl.style.display = show ? 'grid' : 'none';
     }
     function setLoggedInUi(show) {
-      document.body.classList.toggle('v16-login-mode', !show);
       if (v12LoginFirst) v12LoginFirst.disabled = !!show;
       if (uploadAreaEl) uploadAreaEl.style.display = show ? '' : 'none';
       if (screenContainerEl) screenContainerEl.style.display = show ? '' : 'none';
@@ -759,7 +629,6 @@ function getPatchedIndexHtml() {
     btnLogin.onclick = async () => { try { setGameUiVisible(false); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); setTimeout(connect, 100); } catch(e) { alert(e.message); } };
     btnRegister.onclick = async () => { try { setGameUiVisible(false); await api('/api/register', { username: loginUser.value, password: loginPass.value }); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); setTimeout(connect, 100); } catch(e) { alert(e.message); } };
     btnLogout.onclick = async () => { shouldConnectWs = false; setLoggedInUi(false); await api('/api/logout', {}); await refreshMe(); if(ws) ws.close(); };
-    [loginUser, loginPass].forEach(el => el && el.addEventListener('keydown', e => { if (e.key === 'Enter') btnLogin.click(); }));
     refreshMe().then(() => { if (currentUser) setTimeout(connect, 100); });
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
@@ -825,29 +694,29 @@ function getPatchedIndexHtml() {
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V17: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
+  // V15.1: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
     "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
   );
 
-  // V17: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  // V15.1: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
   html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V17: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            }\n          }");
-  // V17: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  html = html.replace('    connect();', '    // V15.1: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          }");
+  // V15.1: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V17: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V15.1: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V17: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V15.1: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
   );
 
-  // V17: Cho phép gõ bình thường trong ô login/register/upload.
+  // V15.1: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -870,6 +739,28 @@ function getPatchedIndexHtml() {
   return html;
 }
 
+
+// =================== HEADLESS DEV API HELPERS ===================
+function checkBridgeToken(req) {
+  const token = process.env.BRIDGE_TOKEN || '';
+  if (!token) return true;
+  const header = req.headers['x-bridge-token'];
+  const queryToken = new URL(req.url, 'http://localhost').searchParams.get('token');
+  return header === token || queryToken === token;
+}
+function headlessUser(externalUserId) {
+  const id = 'ext_' + safeName(externalUserId || 'anonymous');
+  return { id, username: String(externalUserId || 'anonymous'), createdAt: now() };
+}
+function intField(req, name, fallback) {
+  const v = req.body && req.body[name];
+  const n = parseInt(v, 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+function strField(req, name, fallback) {
+  return req.body && req.body[name] !== undefined && req.body[name] !== '' ? String(req.body[name]) : fallback;
+}
+
 // =================== WEB SERVER ===================
 function startWebServer() {
   const app = express();
@@ -883,6 +774,59 @@ function startWebServer() {
 
   const storage = multer.diskStorage({ destination: (req, file, cb) => cb(null, CONFIG.uploadsDir), filename: (req, file, cb) => cb(null, `game_${Date.now()}_${Math.random().toString(36).slice(2)}${path.extname(file.originalname) || '.jar'}`) });
   const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+  // -------- Headless Dev API: create isolated emulator instance without using built-in login/UI --------
+  app.post('/api/instances', upload.single('jar'), async (req, res) => {
+    if (!checkBridgeToken(req)) return res.status(401).json({ error: 'bad bridge token' });
+    if (!req.file) return res.status(400).json({ error: 'missing jar field' });
+    try {
+      const externalUserId = strField(req, 'externalUserId', null);
+      if (!externalUserId) throw new Error('externalUserId is required');
+      const user = headlessUser(externalUserId);
+      const jarPath = path.resolve(req.file.path);
+      const gameHash = sha1File(jarPath);
+
+      // Per-instance runtime config is intentionally kept simple here: process-level env/config is preferred.
+      // For screen size, set SCREEN_WIDTH/SCREEN_HEIGHT before starting this core, or run separate core services.
+      // The REST fields are returned for the dev app and future per-instance extension.
+      const sess = getOrCreateSession(user, gameHash, jarPath);
+      await sess.start();
+      const instanceId = randomId('i_');
+      sess.instanceId = instanceId;
+      headlessInstances.set(instanceId, sess);
+      res.json({
+        success: true,
+        instanceId,
+        gameHash,
+        wsPath: `/ws/${instanceId}`,
+        dataDir: sess.dataDir,
+        config: {
+          width: sess.streamOutWidth,
+          height: sess.streamOutHeight,
+          videoCodec: CONFIG.videoCodec,
+          imageQuality: CONFIG.imageQuality,
+          scale: CONFIG.streamScale,
+        },
+      });
+    } catch (e) {
+      console.error('[Headless create]', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get('/api/instances/:id', (req, res) => {
+    if (!checkBridgeToken(req)) return res.status(401).json({ error: 'bad bridge token' });
+    const sess = headlessInstances.get(req.params.id);
+    if (!sess) return res.status(404).json({ error: 'instance not found' });
+    res.json({ success: true, instanceId: req.params.id, running: sess.isRunning, clients: sess.clients.size, gameHash: sess.gameHash, dataDir: sess.dataDir });
+  });
+
+  app.delete('/api/instances/:id', (req, res) => {
+    if (!checkBridgeToken(req)) return res.status(401).json({ error: 'bad bridge token' });
+    const sess = headlessInstances.get(req.params.id);
+    if (sess) { sess.cleanupProcess(); headlessInstances.delete(req.params.id); emulatorSessions.delete(sess.key); }
+    res.json({ success: true });
+  });
+
   app.post('/upload', upload.single('jar'), async (req, res) => {
     const user = requireUser(req, res); if (!user) return;
     if (!req.file) return res.status(400).json({ error: 'Không có file' });
@@ -890,19 +834,9 @@ function startWebServer() {
       const jarPath = path.resolve(req.file.path);
       const gameHash = sha1File(jarPath);
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V17: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
-      // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
-      stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
       const sess = getOrCreateSession(user, gameHash, jarPath);
-      // Bind các socket hiện tại vào session mới trước khi start để config/loading tới đúng client.
-      if (wss) {
-        wss.clients.forEach((ws) => {
-          if (ws.readyState === WebSocket.OPEN && ws._userId === user.id) sess.addClient(ws);
-        });
-      }
-      sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
       await sess.start();
-      // V17: bind các WebSocket đang mở của user này vào session mới.
+      // V15.1: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -924,6 +858,24 @@ function startWebServer() {
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
 
   wss.on('connection', (ws, req) => {
+    const urlObj = new URL(req.url, 'http://localhost');
+    const wsMatch = urlObj.pathname.match(/^\/ws\/([^/]+)$/);
+    if (wsMatch) {
+      if (!checkBridgeToken(req)) { ws.send(JSON.stringify({ type: 'error', error: 'bad_bridge_token' })); ws.close(); return; }
+      const sess = headlessInstances.get(decodeURIComponent(wsMatch[1]));
+      if (!sess) { ws.send(JSON.stringify({ type: 'error', error: 'instance_not_found' })); ws.close(); return; }
+      sess.addClient(ws);
+      ws.on('message', msg => {
+        try {
+          sess.touch();
+          const data = JSON.parse(msg.toString());
+          if (data.type === 'key') { if (data.state === 'D') sess.sendKeyDown(data.key); else if (data.state === 'U') sess.sendKeyUp(data.key); }
+          else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) sess.sendMouse(cmd, data.x, data.y); }
+        } catch (e) { console.error('[Headless WS]', e.message); }
+      });
+      return;
+    }
+
     const user = db.getUserBySession(parseCookies(req).fj2me_sid);
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
     ws._userId = user.id;

@@ -1,0 +1,23 @@
+{
+  "comment": "Example config for FreeJ2ME Web Bridge integration kit. Paths are relative to this server.js folder unless absolute.",
+  "javaPath": "../jdk8u492-b09-jre/bin/java.exe",
+  "freej2meJar": "../freej2me-plus",
+  "port": 3000,
+
+  "width": 320,
+  "height": 240,
+  "rotate": 0,
+  "phoneType": 0,
+  "sound": 1,
+  "targetFps": 30,
+  "maxFps": 30,
+
+  "streamScale": 1,
+  "imageQuality": 65,
+  "videoCodec": "rgb565",
+  "wsCompression": false,
+  "audioPipe": true,
+
+  "maxActiveSessions": 8,
+  "sessionIdleMs": 600000
+}
