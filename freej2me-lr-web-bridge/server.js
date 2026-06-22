@@ -509,12 +509,12 @@ function getPatchedIndexHtml() {
     <button id="btn-register" style="padding:7px 10px;border:0;border-radius:5px;background:#333;color:#fff">Register</button>
     <button id="btn-logout" style="padding:7px 10px;border:0;border-radius:5px;background:#5c0d0d;color:#fff;display:none">Logout</button>
   </div>`;
-  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer">🔇 Bật âm thanh</button>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>');
+  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
 
   const patchedKeyMap = `const keyMap = {
       'w': 0, 'W': 0, 's': 1, 'S': 1, 'a': 2, 'A': 2, 'd': 3, 'D': 3,
       'ArrowUp': 0, 'ArrowDown': 1, 'ArrowLeft': 2, 'ArrowRight': 3,
-      'q': 9, 'Q': 9, 'e': 8, 'E': 8, 'F1': 9, 'F2': 8,
+      'q': 9, 'Q': 9, 'e': 8, 'E': 8,
       'Enter': 7, 'NumpadEnter': 7, ' ': 7, 'Escape': 19, 'Backspace': 19,
       '0': 6, 'Numpad0': 6, '1': 10, 'Numpad1': 10, '2': 14, 'Numpad2': 14, '3': 11, 'Numpad3': 11,
       '4': 15, 'Numpad4': 15, '5': 18, 'Numpad5': 18, '6': 16, 'Numpad6': 16,
@@ -534,21 +534,46 @@ function getPatchedIndexHtml() {
     const btnLogout = document.getElementById('btn-logout');
     const audioToggle = document.getElementById('audio-toggle');
     const controlsEl = document.getElementById('controls');
+    const uploadAreaEl = document.getElementById('upload-area');
+    const screenContainerEl = document.getElementById('screen-container');
+    const helpEl = document.getElementById('help');
     const v11ControlsGuard = document.getElementById('v11-controls-guard');
+    const v12LoginFirst = document.getElementById('v12-login-first');
     let gameLoaded = false;
+    let shouldConnectWs = false;
     function setGameUiVisible(show) {
       gameLoaded = !!show;
       if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
       if (controlsEl) controlsEl.style.display = show ? 'grid' : 'none';
     }
+    function setLoggedInUi(show) {
+      if (v12LoginFirst) v12LoginFirst.disabled = !!show;
+      if (uploadAreaEl) uploadAreaEl.style.display = show ? '' : 'none';
+      if (screenContainerEl) screenContainerEl.style.display = show ? '' : 'none';
+      if (helpEl) helpEl.style.display = show ? '' : 'none';
+      if (audioToggle) audioToggle.style.display = show ? '' : 'none';
+      if (loginUser) loginUser.style.display = show ? 'none' : '';
+      if (loginPass) loginPass.style.display = show ? 'none' : '';
+      if (btnLogin) btnLogin.style.display = show ? 'none' : '';
+      if (btnRegister) btnRegister.style.display = show ? 'none' : '';
+      if (!show) setGameUiVisible(false);
+    }
+    setLoggedInUi(false);
     setGameUiVisible(false);
     let currentUser = null;
     async function api(path, body) { const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined }); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error || r.statusText); return j; }
-    async function refreshMe() { try { const j = await api('/api/me'); currentUser = j.user; } catch(e) { currentUser = null; } meLabel.textContent = currentUser ? ('Đăng nhập: ' + currentUser.username) : 'Chưa đăng nhập'; btnLogout.style.display = currentUser ? '' : 'none'; }
-    btnLogin.onclick = async () => { try { setGameUiVisible(false); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
-    btnRegister.onclick = async () => { try { setGameUiVisible(false); await api('/api/register', { username: loginUser.value, password: loginPass.value }); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
-    btnLogout.onclick = async () => { setGameUiVisible(false); await api('/api/logout', {}); await refreshMe(); if(ws) ws.close(); };
-    refreshMe();
+    async function refreshMe() {
+      try { const j = await api('/api/me'); currentUser = j.user; } catch(e) { currentUser = null; }
+      meLabel.textContent = currentUser ? ('Đăng nhập: ' + currentUser.username) : 'Vui lòng đăng nhập hoặc đăng ký để bắt đầu';
+      btnLogout.style.display = currentUser ? '' : 'none';
+      setLoggedInUi(!!currentUser);
+      shouldConnectWs = !!currentUser;
+      if (!currentUser) setStatus('Vui lòng đăng nhập', 'connecting');
+    }
+    btnLogin.onclick = async () => { try { setGameUiVisible(false); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); setTimeout(connect, 100); } catch(e) { alert(e.message); } };
+    btnRegister.onclick = async () => { try { setGameUiVisible(false); await api('/api/register', { username: loginUser.value, password: loginPass.value }); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); setTimeout(connect, 100); } catch(e) { alert(e.message); } };
+    btnLogout.onclick = async () => { shouldConnectWs = false; setLoggedInUi(false); await api('/api/logout', {}); await refreshMe(); if(ws) ws.close(); };
+    refreshMe().then(() => { if (currentUser) setTimeout(connect, 100); });
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
@@ -565,7 +590,7 @@ function getPatchedIndexHtml() {
       if(type!==2 || u8.length<9) return true; const len=dv.getUint32(5,false); if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
       const chs=Math.max(1,audioFormat.channels|0), frames=Math.floor(len/(2*chs)); if(frames<=0) return true; const buf=audioCtx.createBuffer(chs,frames,audioFormat.sampleRate||48000); const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
       for(let i=0;i<frames;i++){ for(let c=0;c<chs;c++){ let smp=audioFormat.bigEndian?((u8[off]<<8)|u8[off+1]):(u8[off]|(u8[off+1]<<8)); if(audioFormat.signed&&smp>=0x8000)smp-=0x10000; if(!audioFormat.signed)smp-=0x8000; cd[c][i]=Math.max(-1,Math.min(1,smp/32768)); off+=2; } }
-      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination); const n=audioCtx.currentTime; if(!audioNextTime||audioNextTime<n+0.02||audioNextTime>n+0.35) audioNextTime=n+0.06; src.start(audioNextTime); audioNextTime+=buf.duration; return true;
+      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination); const n=audioCtx.currentTime; if(!audioNextTime||audioNextTime<n+0.02) audioNextTime=n+0.06; if(audioNextTime>n+0.45) return true; src.start(audioNextTime); audioNextTime+=buf.duration; return true;
     }
 
     // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
@@ -574,16 +599,41 @@ function getPatchedIndexHtml() {
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setGameUiVisible(true);\n            }\n          }");
-  // V11: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  // V14: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;');
+  html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
+  html = html.replace('    connect();', '    // V14: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          }");
+  // V14: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V11: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V14: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          try { if (ws) ws.close(); } catch (e) {}\n          setTimeout(connect, 250);"
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V14: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
+  );
+
+  // V14: Cho phép gõ bình thường trong ô login/register/upload.
+  // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
+  // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
+  const inputGuard = `
+    function isTypingTarget(e) {
+      const t = e && e.target;
+      if (!t) return false;
+      const tag = (t.tagName || '').toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable;
+    }
+  `;
+  html = html.replace('    const pressedKeys = new Set();', inputGuard + '\n    const pressedKeys = new Set();');
+  html = html.replace(
+    "window.addEventListener('keydown', (e) => {\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];",
+    "window.addEventListener('keydown', (e) => {\n      if (isTypingTarget(e)) return;\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];"
+  );
+  html = html.replace(
+    "window.addEventListener('keyup', (e) => {\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];",
+    "window.addEventListener('keyup', (e) => {\n      if (isTypingTarget(e)) return;\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];"
   );
   return html;
 }
@@ -610,7 +660,7 @@ function startWebServer() {
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
       const sess = getOrCreateSession(user, gameHash, jarPath);
       await sess.start();
-      // V11: bind các WebSocket đang mở của user này vào session mới.
+      // V14: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
