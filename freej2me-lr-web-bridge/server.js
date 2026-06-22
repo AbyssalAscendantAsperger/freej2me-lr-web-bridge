@@ -106,6 +106,11 @@ function loadConfig() {
 
     maxFps: intConfig('MAX_FPS', fileConfig.maxFps, targetFps),
     streamScale: Math.max(1, intConfig('STREAM_SCALE', fileConfig.streamScale, 1)),
+    // V15 video compression without native deps:
+    // IMAGE_QUALITY >= 90 => rgba 32-bit, >= 45 => rgb565 16-bit, <45 => rgb332 8-bit.
+    // Or set VIDEO_CODEC=rgba|rgb565|rgb332 explicitly.
+    imageQuality: Math.max(1, Math.min(100, intConfig('IMAGE_QUALITY', fileConfig.imageQuality, 65))),
+    videoCodec: String(process.env.VIDEO_CODEC || fileConfig.videoCodec || '').toLowerCase(),
     maxWsBufferedAmount: intConfig('MAX_WS_BUFFERED', fileConfig.maxWsBufferedAmount, 512 * 1024),
     wsCompression: boolConfig('WS_COMPRESSION', fileConfig.wsCompression, false),
     audioPipe: boolConfig('AUDIO_PIPE', fileConfig.audioPipe, true),
@@ -123,6 +128,9 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
+if (!['rgba', 'rgb565', 'rgb332'].includes(CONFIG.videoCodec)) {
+  CONFIG.videoCodec = CONFIG.imageQuality >= 90 ? 'rgba' : (CONFIG.imageQuality >= 45 ? 'rgb565' : 'rgb332');
+}
 const AUDIO_MAGIC = Buffer.from('FJ2A');
 let wss = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
@@ -295,13 +303,13 @@ class EmulatorSession {
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
   getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...extra }; }
   getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) { return { width: Math.max(1, Math.floor(width / CONFIG.streamScale)), height: Math.max(1, Math.floor(height / CONFIG.streamScale)) }; }
-  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale }); }
+  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }); }
 
   addClient(ws) {
     this.touch(); this.clients.add(ws);
     ws._emuSession = this;
     ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => { this.clients.delete(ws); this.touch(); });
   }
@@ -312,20 +320,56 @@ class EmulatorSession {
     return n;
   }
 
-  convertRgb24ToRgba(rgb24, width, height) {
+  convertRgb24ToVideoBuffer(rgb24, width, height) {
     const scale = Math.max(1, CONFIG.streamScale | 0);
-    if (scale <= 1) {
-      const rgba = Buffer.allocUnsafe(width * height * 4);
-      for (let src = 0, dst = 0; src < rgb24.length; src += 3, dst += 4) { rgba[dst] = rgb24[src]; rgba[dst + 1] = rgb24[src + 1]; rgba[dst + 2] = rgb24[src + 2]; rgba[dst + 3] = 255; }
-      return rgba;
+    const outWidth = scale <= 1 ? width : Math.max(1, Math.floor(width / scale));
+    const outHeight = scale <= 1 ? height : Math.max(1, Math.floor(height / scale));
+    const codec = CONFIG.videoCodec;
+
+    if (codec === 'rgb332') {
+      const out = Buffer.allocUnsafe(outWidth * outHeight);
+      let dst = 0;
+      for (let y = 0; y < outHeight; y++) {
+        const srcRow = (y * scale * width) * 3;
+        for (let x = 0; x < outWidth; x++) {
+          const src = srcRow + (x * scale * 3);
+          const r = rgb24[src], g = rgb24[src + 1], b = rgb24[src + 2];
+          out[dst++] = (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6);
+        }
+      }
+      return out;
     }
-    const ow = Math.max(1, Math.floor(width / scale)), oh = Math.max(1, Math.floor(height / scale));
-    const rgba = Buffer.allocUnsafe(ow * oh * 4);
-    for (let y = 0; y < oh; y++) {
-      const srcRow = y * scale * width * 3; let dst = y * ow * 4;
-      for (let x = 0; x < ow; x++) { const src = srcRow + x * scale * 3; rgba[dst++] = rgb24[src]; rgba[dst++] = rgb24[src + 1]; rgba[dst++] = rgb24[src + 2]; rgba[dst++] = 255; }
+
+    if (codec === 'rgb565') {
+      const out = Buffer.allocUnsafe(outWidth * outHeight * 2);
+      let dst = 0;
+      for (let y = 0; y < outHeight; y++) {
+        const srcRow = (y * scale * width) * 3;
+        for (let x = 0; x < outWidth; x++) {
+          const src = srcRow + (x * scale * 3);
+          const r = rgb24[src], g = rgb24[src + 1], b = rgb24[src + 2];
+          const v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+          out[dst++] = v & 0xFF;
+          out[dst++] = (v >> 8) & 0xFF;
+        }
+      }
+      return out;
     }
-    return rgba;
+
+    // rgba 32-bit fallback / best quality.
+    const out = Buffer.allocUnsafe(outWidth * outHeight * 4);
+    let dst = 0;
+    for (let y = 0; y < outHeight; y++) {
+      const srcRow = (y * scale * width) * 3;
+      for (let x = 0; x < outWidth; x++) {
+        const src = srcRow + (x * scale * 3);
+        out[dst++] = rgb24[src];
+        out[dst++] = rgb24[src + 1];
+        out[dst++] = rgb24[src + 2];
+        out[dst++] = 255;
+      }
+    }
+    return out;
   }
 
   async readFrameHeader() {
@@ -453,10 +497,10 @@ class EmulatorSession {
           lastFrameTime = now();
         }
         if (this.countReadyClients() <= 0) { dropBackpressure++; this.sendFrameRequest(); continue; }
-        const rgba = this.convertRgb24ToRgba(rgb24, width, height);
+        const videoBuf = this.convertRgb24ToVideoBuffer(rgb24, width, height);
         for (const ws of this.clients) {
           if (ws.readyState === WebSocket.OPEN) {
-            if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) ws.send(rgba, { binary: true, compress: CONFIG.wsCompression });
+            if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
             else dropBackpressure++;
           }
         }
@@ -577,6 +621,8 @@ function getPatchedIndexHtml() {
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
+    let videoCodec = 'rgba';
+    let imageQuality = 100;
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
     function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'interactive'}); return audioCtx; }
     function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.12,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.18); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.2);}catch(e){} }
@@ -595,27 +641,57 @@ function getPatchedIndexHtml() {
 
     // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
     let latestFrame = null, rafPending = false, reusableImageData = null;
-    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(()=>{ rafPending=false; if(!latestFrame) return; const expectedSize=screenWidth*screenHeight*4; if(latestFrame.length<expectedSize) return; if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); reusableImageData.data.set(latestFrame.subarray(0, expectedSize)); ctx.putImageData(reusableImageData,0,0); frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS'; frameCount=0; lastFpsTime=n; } }); }
+    function decodeVideoFrameToImageData(src, imageData) {
+      const dst = imageData.data;
+      const pixels = screenWidth * screenHeight;
+      if (videoCodec === 'rgb332') {
+        if (src.length < pixels) return false;
+        for (let i = 0, j = 0; i < pixels; i++, j += 4) {
+          const v = src[i];
+          dst[j] = ((v >> 5) & 7) * 255 / 7;
+          dst[j + 1] = ((v >> 2) & 7) * 255 / 7;
+          dst[j + 2] = (v & 3) * 255 / 3;
+          dst[j + 3] = 255;
+        }
+        return true;
+      }
+      if (videoCodec === 'rgb565') {
+        if (src.length < pixels * 2) return false;
+        for (let i = 0, k = 0, j = 0; i < pixels; i++, k += 2, j += 4) {
+          const v = src[k] | (src[k + 1] << 8);
+          dst[j] = ((v >> 11) & 31) * 255 / 31;
+          dst[j + 1] = ((v >> 5) & 63) * 255 / 63;
+          dst[j + 2] = (v & 31) * 255 / 31;
+          dst[j + 3] = 255;
+        }
+        return true;
+      }
+      const expectedSize = pixels * 4;
+      if (src.length < expectedSize) return false;
+      dst.set(src.subarray(0, expectedSize));
+      return true;
+    }
+    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(()=>{ rafPending=false; if(!latestFrame) return; if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); if(!decodeVideoFrameToImageData(latestFrame, reusableImageData)) return; ctx.putImageData(reusableImageData,0,0); frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS ['+videoCodec+' q'+imageQuality+']'; frameCount=0; lastFpsTime=n; } }); }
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V14: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  // V15: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
   html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V14: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace('    connect();', '    // V15: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
   html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          }");
-  // V14: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  // V15: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V14: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V15: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V14: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V15: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
   );
 
-  // V14: Cho phép gõ bình thường trong ô login/register/upload.
+  // V15: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -660,7 +736,7 @@ function startWebServer() {
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
       const sess = getOrCreateSession(user, gameHash, jarPath);
       await sess.start();
-      // V14: bind các WebSocket đang mở của user này vào session mới.
+      // V15: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -676,7 +752,7 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
+  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
@@ -686,7 +762,7 @@ function startWebServer() {
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
     ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
-    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale })); }
+    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality })); }
     else sess.addClient(ws);
     ws.on('message', msg => {
       try {
