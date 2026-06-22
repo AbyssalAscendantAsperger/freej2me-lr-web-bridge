@@ -147,3 +147,5 @@ freej2me-lr-web-bridge/freej2me_data/
 freej2me-plus/sconfig
 freej2me_data/users.json
 freej2me_data/users
+package-lock.json
+

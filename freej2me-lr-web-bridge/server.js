@@ -1,4 +1,16 @@
-
+/******************************************************************************
+ * FreeJ2ME-Plus Web Bridge - V10 Multi-user Login + Per-user Save + Performance
+ *
+ * V10 includes:
+ * - V9-style performance: per-client latest-frame rendering patch, lower logging,
+ *   per-session backpressure dropping, no duplicate frame skipping by default.
+ * - JSON DB login/register/logout.
+ * - One emulator process per logged-in user/game session.
+ * - Per-user/per-game dataDir: freej2me_data/users/<userId>/games/<sha1>/runtime
+ * - AudioPipe v2/v2-debug support through stderr FJ2A packets.
+ *
+ * Drop this file over server.js.
+ *****************************************************************************/
 
 const fs = require('fs');
 const path = require('path');
@@ -145,6 +157,9 @@ function loadConfig() {
 
     frameResyncLog: boolConfig('FRAME_RESYNC_LOG', fileConfig.frameResyncLog, false),
     audioDebugLog: boolConfig('AUDIO_DEBUG_LOG', fileConfig.audioDebugLog, false),
+    // V19: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
+    audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, 40))),
+    audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, 180))),
 
     maxActiveSessions: intConfig('MAX_ACTIVE_SESSIONS', fileConfig.maxActiveSessions, 8),
     sessionIdleMs: intConfig('SESSION_IDLE_MS', fileConfig.sessionIdleMs, 10 * 60 * 1000),
@@ -338,6 +353,10 @@ class EmulatorSession {
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
     this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
     this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
+    this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 };
+    this.audioPcmChunks = [];
+    this.audioPcmBytes = 0;
+    this.audioFlushTimer = null;
     this.lastActivity = now();
     this.dataDir = path.join(CONFIG.dataDir, 'users', safeName(this.userId), 'games', gameHash, 'runtime');
     ensureDir(this.dataDir);
@@ -362,7 +381,9 @@ class EmulatorSession {
     detachClientFromOtherSessions(ws, this);
     this.clients.add(ws);
     ws._emuSession = this;
+    console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
     ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash }));
+    ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
     ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => { this.clients.delete(ws); this.touch(); });
@@ -447,6 +468,44 @@ class EmulatorSession {
     throw new Error('Frame loop stopped');
   }
 
+  makeAudioPcmPacket(payload) {
+    const h = Buffer.allocUnsafe(9);
+    h.write('FJ2A', 0, 4, 'ascii');
+    h[4] = 2;
+    h.writeUInt32BE(payload.length, 5);
+    return Buffer.concat([h, payload]);
+  }
+
+  audioBytesPerMs() {
+    const f = this.currentAudioFormat;
+    if (!f || !f.sampleRate || !f.channels || !f.bits) return 4096;
+    return Math.max(1, Math.ceil(f.sampleRate * f.channels * (f.bits / 8) / 1000));
+  }
+
+  flushAudioPcm() {
+    if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
+    if (!this.audioPcmBytes || this.audioPcmChunks.length === 0) return;
+    const payload = this.audioPcmChunks.length === 1 ? this.audioPcmChunks[0] : Buffer.concat(this.audioPcmChunks, this.audioPcmBytes);
+    this.audioPcmChunks = [];
+    this.audioPcmBytes = 0;
+    const packet = this.makeAudioPcmPacket(payload);
+    this.broadcast(packet, { binary: true, compress: false });
+  }
+
+  queueAudioPcm(payload) {
+    if (!payload || payload.length <= 0) return;
+    this.audioPcmChunks.push(Buffer.from(payload));
+    this.audioPcmBytes += payload.length;
+    const targetBytes = this.audioBytesPerMs() * CONFIG.audioPacketMs;
+    if (this.audioPcmBytes >= targetBytes) {
+      this.flushAudioPcm();
+      return;
+    }
+    if (!this.audioFlushTimer) {
+      this.audioFlushTimer = setTimeout(() => this.flushAudioPcm(), CONFIG.audioPacketMs);
+    }
+  }
+
   logAudioText(buf) {
     if (!buf || !buf.length) return;
     const text = buf.toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]+/g, '').trim();
@@ -468,6 +527,7 @@ class EmulatorSession {
           const packet = Buffer.from(this.audioPipeBuffer.slice(0, 13));
           this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
           this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
+          this.flushAudioPcm();
           console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
           this.broadcast(packet, { binary: true, compress: false });
           this.broadcastJson(this.getAudioStatus({ event: 'format' }));
@@ -478,10 +538,10 @@ class EmulatorSession {
           const len = this.audioPipeBuffer.readUInt32BE(5);
           if (len > 1024 * 1024) { this.audioPipeBuffer = this.audioPipeBuffer.slice(1); continue; }
           const total = 9 + len; if (this.audioPipeBuffer.length < total) return;
-          const packet = Buffer.from(this.audioPipeBuffer.slice(0, total));
+          const payload = Buffer.from(this.audioPipeBuffer.slice(9, total));
           this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}`);
-          this.broadcast(packet, { binary: true, compress: false });
+          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, coalesce=${CONFIG.audioPacketMs}ms`);
+          this.queueAudioPcm(payload);
           this.audioPipeBuffer = this.audioPipeBuffer.slice(total); continue;
         }
         this.audioPipeBuffer = this.audioPipeBuffer.slice(1);
@@ -491,6 +551,8 @@ class EmulatorSession {
 
   cleanupProcess() {
     this.frameLoopActive = false; this.isRunning = false;
+    this.flushAudioPcm();
+    if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     if (this.process && !this.process.killed) { try { this.process.kill('SIGTERM'); } catch (e) {} }
     this.process = null; this.stdoutReader = null; this.stdin = null;
   }
@@ -505,7 +567,7 @@ class EmulatorSession {
     const jvmArgs = [getEncodingJvmArg(encodingName), '-Djava.awt.headless=true', ...(CONFIG.audioPipe ? ['-Dfreej2me.audioPipe=1'] : []), '-jar', CONFIG.freej2meJar];
     const proc = spawn(CONFIG.javaPath, [...jvmArgs, ...buildArgs()], { stdio: ['pipe', 'pipe', 'pipe'], cwd: this.dataDir });
     this.process = proc; this.stdin = proc.stdin; this.stdoutReader = new StdoutReader(proc.stdout);
-    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null; this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
+    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null; this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 }; this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 }; this.audioPcmChunks = []; this.audioPcmBytes = 0; if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     this.attachAudioPipe(proc.stderr);
     proc.on('exit', code => { if (this.process === proc) { console.log(`[EMU ${this.username}] exited ${code}`); this.cleanupProcess(); } });
     proc.on('error', err => { if (this.process === proc) { console.error(`[EMU ${this.username}] error:`, err.message); this.cleanupProcess(); } });
@@ -545,6 +607,8 @@ class EmulatorSession {
         if (dims.width !== this.streamOutWidth || dims.height !== this.streamOutHeight) this.broadcastConfig();
         const rgb24 = await this.stdoutReader.readBytes(frameSize);
         frameNo++;
+        this.videoStats.framesRead++;
+        this.videoStats.lastFrameAt = now();
         if (minFrameInterval > 0) {
           const elapsed = now() - lastFrameTime;
           if (elapsed < minFrameInterval) await new Promise(r => setTimeout(r, minFrameInterval - elapsed));
@@ -726,6 +790,18 @@ function getPatchedIndexHtml() {
     const v12LoginFirst = document.getElementById('v12-login-first');
     let gameLoaded = false;
     let shouldConnectWs = false;
+    let wsReconnectTimer = null;
+    let wsConnecting = false;
+    function reconnectWsSoon(delay = 250) {
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = setTimeout(() => {
+        if (!shouldConnectWs) return;
+        try { if (ws && ws.readyState !== WebSocket.CLOSED) ws.close(); } catch(e) {}
+        ws = null;
+        wsConnecting = false;
+        connect();
+      }, delay);
+    }
     function setGameUiVisible(show) {
       gameLoaded = !!show;
       if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
@@ -766,20 +842,32 @@ function getPatchedIndexHtml() {
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
     let videoCodec = 'rgba';
     let imageQuality = 100;
+    const AUDIO_START_BUFFER_SEC = 0.18; // overwritten by server config not needed; stable default for tunnel jitter
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
-    function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'interactive'}); return audioCtx; }
-    function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.12,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.18); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.2);}catch(e){} }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+0.08; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted) browserTestBeep(); } };
+    function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'playback'}); return audioCtx; }
+    function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.16); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.18);}catch(e){} }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+AUDIO_START_BUFFER_SEC; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted){ audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; browserTestBeep(); } } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)+' jitter buffer'); }
     function handleAudioPacket(u8){
-      if(!isAudioPacket(u8)) return false; const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
-      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; return true; }
-      if(type!==2 || u8.length<9) return true; const len=dv.getUint32(5,false); if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
-      const chs=Math.max(1,audioFormat.channels|0), frames=Math.floor(len/(2*chs)); if(frames<=0) return true; const buf=audioCtx.createBuffer(chs,frames,audioFormat.sampleRate||48000); const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
+      if(!isAudioPacket(u8)) return false;
+      const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; if(audioCtx) audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; return true; }
+      if(type!==2 || u8.length<9) return true;
+      const len=dv.getUint32(5,false);
+      if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
+      const chs=Math.max(1,audioFormat.channels|0), frames=Math.floor(len/(2*chs)); if(frames<=0) return true;
+      const buf=audioCtx.createBuffer(chs,frames,audioFormat.sampleRate||48000);
+      const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
       for(let i=0;i<frames;i++){ for(let c=0;c<chs;c++){ let smp=audioFormat.bigEndian?((u8[off]<<8)|u8[off+1]):(u8[off]|(u8[off+1]<<8)); if(audioFormat.signed&&smp>=0x8000)smp-=0x10000; if(!audioFormat.signed)smp-=0x8000; cd[c][i]=Math.max(-1,Math.min(1,smp/32768)); off+=2; } }
-      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination); const n=audioCtx.currentTime; if(!audioNextTime||audioNextTime<n+0.02) audioNextTime=n+0.06; if(audioNextTime>n+0.45) return true; src.start(audioNextTime); audioNextTime+=buf.duration; return true;
+      const nowAudio=audioCtx.currentTime;
+      if(!audioNextTime || audioNextTime < nowAudio + 0.04) audioNextTime = nowAudio + AUDIO_START_BUFFER_SEC;
+      // If backlog grows too much, drop this packet rather than playing old audio late.
+      if(audioNextTime > nowAudio + 0.9) return true;
+      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination);
+      src.start(audioNextTime); audioNextTime += buf.duration;
+      return true;
     }
 
     // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
@@ -825,29 +913,39 @@ function getPatchedIndexHtml() {
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V17: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
+  // V19: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
     "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
   );
 
-  // V17: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
-  html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;');
+  // V19: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
+  html = html.replace(
+    "      ws.onopen = () => {\n        isConnected = true;",
+    "      ws.onopen = () => {\n        wsConnecting = false;\n        isConnected = true;"
+  );
+  html = html.replace(
+    "      ws.onclose = () => {\n        isConnected = false;",
+    "      ws.onclose = () => {\n        wsConnecting = false;\n        isConnected = false;"
+  );
+
+  // V19: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;\n      if (wsConnecting) return;\n      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;\n      wsConnecting = true;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V17: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            }\n          }");
-  // V17: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  html = html.replace('    connect();', '    // V19: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
+  // V19: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V17: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V19: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V17: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V19: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
   );
 
-  // V17: Cho phép gõ bình thường trong ô login/register/upload.
+  // V19: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -890,7 +988,7 @@ function startWebServer() {
       const jarPath = path.resolve(req.file.path);
       const gameHash = sha1File(jarPath);
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V17: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
+      // V19: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
       // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
       stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
       const sess = getOrCreateSession(user, gameHash, jarPath);
@@ -902,7 +1000,7 @@ function startWebServer() {
       }
       sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
       await sess.start();
-      // V17: bind các WebSocket đang mở của user này vào session mới.
+      // V19: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -918,7 +1016,7 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
+  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
