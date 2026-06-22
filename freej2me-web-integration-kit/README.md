@@ -131,3 +131,20 @@ $env:AUDIO_PIPE="1"
 $env:SOUND="1"
 npm start
 ```
+
+## For dev headless integration
+
+Nếu dev khác không muốn dùng UI/login/keymap mặc định, dùng thư mục:
+
+```txt
+for-dev/
+```
+
+Nó cung cấp headless API:
+
+```txt
+POST /api/instances
+WS   /ws/:instanceId
+```
+
+Dev tự quản login/map phím/canvas, bridge chỉ nhận JAR và xuất frame/audio.

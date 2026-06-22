@@ -127,3 +127,23 @@ Key index layout FreeJ2ME/libretro:
 18 Num5
 19 Clear
 ```
+
+## V17 session behavior
+
+For the same `externalUserId`, creating a new instance stops older emulator sessions of that user before starting the new one. This prevents stale frames from an old JAR mixing with the new JAR.
+
+If you want multiple games running concurrently for the same user, use different `externalUserId` values, for example:
+
+```txt
+user_123_slot_1
+user_123_slot_2
+```
+
+## Per-instance screen/options
+
+The headless server accepts screen/options in `POST /api/instances` and applies them to that emulator process:
+
+```txt
+width, height, rotate, phoneType, fps, maxFps, sound, audioPipe,
+streamScale, imageQuality, videoCodec, wsCompression
+```

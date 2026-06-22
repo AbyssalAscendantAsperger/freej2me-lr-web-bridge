@@ -2,51 +2,58 @@
 
 Thư mục này dành cho dev **không muốn dùng UI/login/keymap mặc định** của bridge.
 
-Mục tiêu:
+Core quản lý:
 
-```txt
-Bridge core quản lý:
-- nhận JAR
+- nhận JAR/JAD
 - chạy FreeJ2ME instance
 - xuất hình/audio qua WebSocket
-- lưu save riêng theo externalUserId + gameHash
-- nhận input dạng key index/touch từ hệ thống bên ngoài
+- save riêng theo `externalUserId + gameHash`
+- nhận input chuẩn key/touch
+- per-instance tuỳ chỉnh width/height/fps/videoCodec/streamScale/audioPipe
 
 Web/app của dev quản lý:
-- đăng nhập/user/token của họ
+
+- login/user/token của họ
 - giao diện upload/chọn game
-- layout màn hình/canvas CSS
-- map phím của họ
-- nút ảo/gamepad riêng
-- truyền tuỳ chỉnh width/height/videoCodec/fps/... vào bridge
-```
+- canvas/layout/CSS
+- map phím/nút ảo/gamepad
+- truyền `externalUserId` và tuỳ chỉnh vào core
 
 ## Files
 
 ```txt
-for-dev/server/headless-core-server.js   Server core không UI/login
-for-dev/client/headless-client.js        SDK client tối giản để nhận màn/audio + gửi input
-for-dev/docs/PROTOCOL.md                 API/WS protocol
-for-dev/examples/custom-ui.html          Ví dụ web tự quản UI/keymap
+for-dev/server/headless-core-server.js
+for-dev/client/headless-client.js
+for-dev/docs/PROTOCOL.md
+for-dev/examples/custom-ui.html
 ```
 
-## Chạy core server
+## V17 có ảnh hưởng gì đến kit?
 
-Copy `headless-core-server.js` vào project bridge, hoặc chạy riêng trong cùng thư mục có `config.json`/`freej2me-plus`.
+Có, theo hướng tốt hơn:
+
+- Khi dev tạo instance mới cho cùng `externalUserId`, core dừng emulator cũ của user đó để tránh frame cũ/mới lẫn nhau.
+- WebSocket chỉ thuộc về đúng 1 emulator session.
+- Java auto-detect tốt hơn trên Linux: `JAVA_PATH`, `JAVA_HOME`, `which java`, check version >= 8.
+- Headless API đã nhận per-instance options như `width=320&height=240&videoCodec=rgb565`.
+
+## Chạy core server
 
 ```powershell
 $env:BRIDGE_TOKEN="dev-secret"
 $env:PORT="3100"
-node headless-core-server.js
+node for-dev/server/headless-core-server.js
 ```
 
-Nếu không set `BRIDGE_TOKEN`, server vẫn chạy nhưng không khuyến nghị public.
+Linux:
 
-## Flow tích hợp
+```bash
+export BRIDGE_TOKEN=dev-secret
+export PORT=3100
+node for-dev/server/headless-core-server.js
+```
 
-1. Web của dev login user theo hệ thống của họ.
-2. Web lấy `externalUserId` từ backend của họ, ví dụ `user_123`.
-3. Web gọi bridge:
+## Tạo instance
 
 ```http
 POST /api/instances
@@ -57,77 +64,43 @@ multipart/form-data:
   width=320
   height=240
   videoCodec=rgb565
+  streamScale=1
   maxFps=30
 ```
 
-4. Bridge trả:
+Response:
 
 ```json
 {
+  "success": true,
   "instanceId": "i_xxx",
   "gameHash": "sha1...",
-  "wsPath": "/ws/i_xxx"
+  "wsPath": "/ws/i_xxx",
+  "config": { "width": 320, "height": 240, "videoCodec": "rgb565" }
 }
 ```
 
-5. Web mở WebSocket `/ws/i_xxx`.
-6. Web nhận binary frame/audio và tự vẽ canvas.
-7. Web tự map phím rồi gửi input:
-
-```json
-{ "type": "key", "state": "D", "key": 0 }
-{ "type": "key", "state": "U", "key": 0 }
-```
-
-## Màn hình 320x240 / 240x320 / custom
-
-Dev truyền width/height khi tạo instance:
+## Kết nối WebSocket
 
 ```txt
-width=320 height=240  # landscape
-width=240 height=320  # portrait
-width=176 height=208  # old Nokia
+/ws/i_xxx?token=dev-secret
 ```
-
-Bridge xuất config qua WS:
-
-```json
-{ "type":"config", "width":320, "height":240, "videoCodec":"rgb565" }
-```
-
-Dev tự CSS scale canvas theo ý họ.
 
 ## Save riêng
 
-Save nằm theo:
-
 ```txt
-freej2me_data/external/<externalUserId>/games/<gameHash>/runtime
+freej2me_data/users/ext_<externalUserId>/games/<gameHash>/runtime
 ```
 
-Nếu dev truyền cùng `externalUserId` + cùng JAR thì save sẽ dùng lại.
-Nếu user khác hoặc game khác thì save tách riêng.
+## Màn hình
 
-## Lưu ý về `headless-core-server.js`
-
-File này hiện là bản reference dựa trên server bridge mới nhất đã chạy ổn, có sẵn UI fallback.
-Khi dùng cho hệ thống khác, dev có thể:
-
-1. Chạy server này như service riêng.
-2. Không dùng route `/` UI mặc định.
-3. Tích hợp qua REST/WebSocket theo `docs/PROTOCOL.md` hoặc dùng iframe nếu muốn nhanh.
-
-Nếu muốn bản core thuần không route UI, có thể tách class `EmulatorSession` và các route upload/ws từ file này.
-
-### Headless API đã có sẵn
-
-`headless-core-server.js` có sẵn:
+Dev truyền `width`/`height` khi tạo instance:
 
 ```txt
-POST   /api/instances
-GET    /api/instances/:id
-DELETE /api/instances/:id
-WS     /ws/:instanceId
+320x240 landscape
+240x320 portrait
+176x208 old Nokia
+360x640 touch
 ```
 
-Lưu ý bản đầu này dùng runtime config theo process cho width/height. Nếu cần mỗi instance một màn hình khác nhau cùng lúc, chạy nhiều core service trên port khác nhau hoặc tách per-instance config sâu hơn trong `EmulatorSession`.
+Core xuất đúng `config.width/config.height`, dev tự scale canvas.
