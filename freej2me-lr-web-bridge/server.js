@@ -22,6 +22,11 @@ const http = require('http');
 const WebSocket = require('ws');
 let sharp = null;
 try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
+let helmet = null, cors = null, expressRateLimit = null, systeminformation = null;
+try { helmet = require('helmet'); } catch(e) {}
+try { cors = require('cors'); } catch(e) {}
+try { expressRateLimit = require('express-rate-limit'); } catch(e) {}
+try { systeminformation = require('systeminformation'); } catch(e) {}
 
 // =================== CONFIG ===================
 function loadConfig() {
@@ -161,10 +166,10 @@ function loadConfig() {
 
     frameResyncLog: boolConfig('FRAME_RESYNC_LOG', fileConfig.frameResyncLog, false),
     audioDebugLog: boolConfig('AUDIO_DEBUG_LOG', fileConfig.audioDebugLog, false),
-    // V22: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
+    // V24: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
     audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, 40))),
     audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, 180))),
-    // V22: optional Opus/WebM HTTP audio stream. Requires ffmpeg.
+    // V24: optional Opus/WebM HTTP audio stream. Requires ffmpeg.
     audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || 'opus').toLowerCase(),
     opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || '64k'),
     ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
@@ -173,6 +178,29 @@ function loadConfig() {
     sessionIdleMs: intConfig('SESSION_IDLE_MS', fileConfig.sessionIdleMs, 10 * 60 * 1000),
     noClientShutdownMs: intConfig('NO_CLIENT_SHUTDOWN_MS', fileConfig.noClientShutdownMs, 5000),
     inputIdleShutdownMs: intConfig('INPUT_IDLE_SHUTDOWN_MS', fileConfig.inputIdleShutdownMs, 0),
+
+    // V23 security/resource guard defaults. Safe for public demo; devs can tune by env/config.
+    sessionPolicy: String(process.env.SESSION_POLICY || fileConfig.sessionPolicy || 'single').toLowerCase(), // single|multi
+    requireLogin: boolConfig('REQUIRE_LOGIN', fileConfig.requireLogin, true),
+    maxAccountsPerIp: intConfig('MAX_ACCOUNTS_PER_IP', fileConfig.maxAccountsPerIp, 5),
+    maxWsPerIp: intConfig('MAX_WS_PER_IP', fileConfig.maxWsPerIp, 8),
+    maxClientsPerInstance: intConfig('MAX_CLIENTS_PER_INSTANCE', fileConfig.maxClientsPerInstance, 2),
+    queueMaxSize: intConfig('QUEUE_MAX_SIZE', fileConfig.queueMaxSize, 16),
+    startConcurrency: intConfig('START_CONCURRENCY', fileConfig.startConcurrency, Math.max(1, Math.min(2, Math.floor(require('os').cpus().length / 2)))),
+    authRateLimit: intConfig('AUTH_RATE_LIMIT', fileConfig.authRateLimit, 20),
+    uploadRateLimit: intConfig('UPLOAD_RATE_LIMIT', fileConfig.uploadRateLimit, 6),
+    apiRateLimit: intConfig('API_RATE_LIMIT', fileConfig.apiRateLimit, 180),
+    wsRateLimit: intConfig('WS_RATE_LIMIT', fileConfig.wsRateLimit, 60),
+    rateLimitWindowMs: intConfig('RATE_LIMIT_WINDOW_MS', fileConfig.rateLimitWindowMs, 60 * 1000),
+    corsOrigin: process.env.CORS_ORIGIN || fileConfig.corsOrigin || '',
+
+    // V24 storage/quota cleanup.
+    maxUploadMb: intConfig('MAX_UPLOAD_MB', fileConfig.maxUploadMb, 50),
+    maxUserStorageMb: intConfig('MAX_USER_STORAGE_MB', fileConfig.maxUserStorageMb, 500),
+    maxTotalStorageMb: intConfig('MAX_TOTAL_STORAGE_MB', fileConfig.maxTotalStorageMb, 0), // 0 = disabled
+    uploadRetentionHours: intConfig('UPLOAD_RETENTION_HOURS', fileConfig.uploadRetentionHours, 24),
+    tempRetentionHours: intConfig('TEMP_RETENTION_HOURS', fileConfig.tempRetentionHours, 6),
+    cleanupIntervalMs: intConfig('CLEANUP_INTERVAL_MS', fileConfig.cleanupIntervalMs, 10 * 60 * 1000),
 
     uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, 'uploads'),
     dataDir: process.env.DATA_DIR || path.join(__dirname, 'freej2me_data'),
@@ -213,6 +241,134 @@ function parseCookies(req) {
   });
   return out;
 }
+function getIp(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return req.socket && req.socket.remoteAddress || 'unknown';
+}
+
+const memoryBuckets = new Map();
+function memoryRateLimit(key, limit, windowMs) {
+  const t = now();
+  let b = memoryBuckets.get(key);
+  if (!b || t >= b.resetAt) { b = { count: 0, resetAt: t + windowMs }; memoryBuckets.set(key, b); }
+  b.count++;
+  return { ok: b.count <= limit, count: b.count, resetAt: b.resetAt, retryAfterMs: Math.max(0, b.resetAt - t) };
+}
+function rateLimitMiddleware(name, limitGetter) {
+  return (req, res, next) => {
+    const limit = typeof limitGetter === 'function' ? limitGetter(req) : limitGetter;
+    const ip = getIp(req);
+    const r = memoryRateLimit(`${name}:${ip}`, limit, CONFIG.rateLimitWindowMs);
+    res.setHeader('X-RateLimit-Limit', String(limit));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, limit - r.count)));
+    if (!r.ok) return res.status(429).json({ error: 'rate_limited', retryAfterMs: r.retryAfterMs });
+    next();
+  };
+}
+
+function countOpenWsForIp(ip) {
+  if (!wss) return 0;
+  let n = 0;
+  wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN && ws._ip === ip) n++; });
+  return n;
+}
+function closeUserSockets(userId, reason = 'session_invalidated') {
+  if (!wss) return;
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN && ws._userId === userId) {
+      try { ws.send(JSON.stringify({ type: 'error', error: reason })); } catch(e) {}
+      try { ws.close(); } catch(e) {}
+    }
+  });
+}
+
+class StartQueue {
+  constructor(concurrency, maxSize) { this.concurrency = concurrency; this.maxSize = maxSize; this.running = 0; this.queue = []; }
+  add(task) {
+    if (this.queue.length + this.running >= this.maxSize) return Promise.reject(new Error('Server queue đầy, thử lại sau'));
+    return new Promise((resolve, reject) => { this.queue.push({ task, resolve, reject }); this.pump(); });
+  }
+  pump() {
+    while (this.running < this.concurrency && this.queue.length) {
+      const item = this.queue.shift(); this.running++;
+      Promise.resolve().then(item.task).then(item.resolve, item.reject).finally(() => { this.running--; this.pump(); });
+    }
+  }
+  status() { return { running: this.running, queued: this.queue.length, concurrency: this.concurrency, maxSize: this.maxSize }; }
+}
+const startQueue = new StartQueue(CONFIG.startConcurrency, CONFIG.queueMaxSize);
+
+function dirSizeBytes(dir) {
+  let total = 0;
+  try {
+    if (!fs.existsSync(dir)) return 0;
+    const st = fs.statSync(dir);
+    if (st.isFile()) return st.size;
+    for (const name of fs.readdirSync(dir)) total += dirSizeBytes(path.join(dir, name));
+  } catch (e) {}
+  return total;
+}
+function removePathSafe(p) {
+  try {
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+    return true;
+  } catch (e) { console.warn('[Cleanup] remove failed', p, e.message); return false; }
+}
+function cleanupUploads() {
+  const cutoff = now() - CONFIG.uploadRetentionHours * 3600 * 1000;
+  let removed = 0, bytes = 0;
+  try {
+    if (!fs.existsSync(CONFIG.uploadsDir)) return { removed, bytes };
+    for (const name of fs.readdirSync(CONFIG.uploadsDir)) {
+      const fp = path.join(CONFIG.uploadsDir, name);
+      const st = fs.statSync(fp);
+      if (st.mtimeMs < cutoff) { bytes += st.isFile() ? st.size : dirSizeBytes(fp); if (removePathSafe(fp)) removed++; }
+    }
+  } catch (e) { console.warn('[Cleanup] uploads:', e.message); }
+  if (removed) console.log(`[Cleanup] uploads removed=${removed}, bytes=${bytes}`);
+  return { removed, bytes };
+}
+function getUserDataDir(userId) { return path.join(CONFIG.dataDir, 'users', safeName(userId)); }
+function getUserStorageBytes(userId) { return dirSizeBytes(getUserDataDir(userId)); }
+function enforceUserStorageQuota(userId) {
+  if (!CONFIG.maxUserStorageMb || CONFIG.maxUserStorageMb <= 0) return;
+  const used = getUserStorageBytes(userId);
+  const max = CONFIG.maxUserStorageMb * 1024 * 1024;
+  if (used > max) throw new Error(`User storage quota exceeded: ${(used/1024/1024).toFixed(1)}MB / ${CONFIG.maxUserStorageMb}MB`);
+}
+function enforceTotalStorageQuota() {
+  if (!CONFIG.maxTotalStorageMb || CONFIG.maxTotalStorageMb <= 0) return;
+  const used = dirSizeBytes(CONFIG.dataDir);
+  const max = CONFIG.maxTotalStorageMb * 1024 * 1024;
+  if (used > max) throw new Error(`Total storage quota exceeded: ${(used/1024/1024).toFixed(1)}MB / ${CONFIG.maxTotalStorageMb}MB`);
+}
+function cleanupTempRuntime() {
+  // Conservative cleanup: remove obvious temp files/dirs older than TEMP_RETENTION_HOURS, never delete user save runtime root wholesale.
+  const cutoff = now() - CONFIG.tempRetentionHours * 3600 * 1000;
+  let removed = 0, bytes = 0;
+  const candidates = ['tmp', 'temp', 'cache'];
+  function walk(dir) {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const name of fs.readdirSync(dir)) {
+        const fp = path.join(dir, name); const st = fs.statSync(fp);
+        if (st.isDirectory()) {
+          if (candidates.includes(name.toLowerCase()) && st.mtimeMs < cutoff) { bytes += dirSizeBytes(fp); if (removePathSafe(fp)) removed++; }
+          else walk(fp);
+        } else if ((name.endsWith('.tmp') || name.endsWith('.log')) && st.mtimeMs < cutoff) { bytes += st.size; if (removePathSafe(fp)) removed++; }
+      }
+    } catch(e) {}
+  }
+  walk(path.join(CONFIG.dataDir, 'users'));
+  if (removed) console.log(`[Cleanup] temp removed=${removed}, bytes=${bytes}`);
+  return { removed, bytes };
+}
+function runStorageCleanup() {
+  cleanupUploads(); cleanupTempRuntime();
+}
+
+
 function setCookie(res, name, value, opts = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, 'Path=/', 'SameSite=Lax'];
   if (opts.httpOnly !== false) parts.push('HttpOnly');
@@ -274,23 +430,27 @@ class JsonDB {
   }
   save() { fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2)); }
   publicUser(user) { return user ? { id: user.id, username: user.username, createdAt: user.createdAt } : null; }
-  register(username, password) {
+  register(username, password, ip = 'unknown') {
     username = String(username || '').trim().toLowerCase();
     if (!/^[a-z0-9_.-]{3,32}$/.test(username)) throw new Error('Username 3-32 ký tự, chỉ a-z 0-9 _ . -');
     if (!password || String(password).length < 4) throw new Error('Password tối thiểu 4 ký tự');
     if (this.data.users[username]) throw new Error('Username đã tồn tại');
+    const ipCount = Object.values(this.data.users).filter(u => u.createdIp === ip).length;
+    if (CONFIG.maxAccountsPerIp > 0 && ipCount >= CONFIG.maxAccountsPerIp) throw new Error('IP này đã tạo quá nhiều tài khoản');
     const salt = crypto.randomBytes(16).toString('hex');
-    const user = { id: randomId('u_'), username, salt, passwordHash: sha256(salt + ':' + password), createdAt: now() };
+    const user = { id: randomId('u_'), username, salt, passwordHash: sha256(salt + ':' + password), createdAt: now(), createdIp: ip };
     this.data.users[username] = user; this.save(); return user;
   }
   login(username, password) {
     username = String(username || '').trim().toLowerCase();
     const user = this.data.users[username];
     if (!user || user.passwordHash !== sha256(user.salt + ':' + password)) throw new Error('Sai username hoặc password');
+    if (CONFIG.sessionPolicy === 'single') this.invalidateUserSessions(user.id);
     const sid = randomId('sid_');
     this.data.sessions[sid] = { userId: user.id, username: user.username, createdAt: now(), expiresAt: now() + 30 * 24 * 3600 * 1000 };
     this.save(); return { sid, user };
   }
+  invalidateUserSessions(userId) { for (const [sid, sess] of Object.entries(this.data.sessions)) if (sess.userId === userId) delete this.data.sessions[sid]; }
   logout(sid) { if (sid && this.data.sessions[sid]) { delete this.data.sessions[sid]; this.save(); } }
   getUserBySession(sid) {
     const sess = this.data.sessions[sid];
@@ -442,6 +602,7 @@ class EmulatorSession {
     this.touch();
     this.cancelNoClientShutdown();
     detachClientFromOtherSessions(ws, this);
+    if (CONFIG.maxClientsPerInstance > 0 && this.clients.size >= CONFIG.maxClientsPerInstance) { try { ws.send(JSON.stringify({ type: 'error', error: 'too_many_clients_for_instance' })); } catch(e) {} try { ws.close(); } catch(e) {} return; }
     this.clients.add(ws);
     ws._emuSession = this;
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
@@ -1105,13 +1266,13 @@ function getPatchedIndexHtml() {
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V22: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
+  // V24: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
     "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
   );
 
-  // V22: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
+  // V24: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
   html = html.replace(
     "      ws.onopen = () => {\n        isConnected = true;",
     "      ws.onopen = () => {\n        wsConnecting = false;\n        isConnected = true;"
@@ -1121,23 +1282,23 @@ function getPatchedIndexHtml() {
     "      ws.onclose = () => {\n        wsConnecting = false;\n        isConnected = false;"
   );
 
-  // V22: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  // V24: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
   html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;\n      if (wsConnecting) return;\n      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;\n      wsConnecting = true;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V22: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace('    connect();', '    // V24: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
   html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n              if (msg.audioUrl) { opusAudioUrl = msg.audioUrl; if (audioUnlocked && !audioMuted) startOpusAudio(); }\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
-  // V22: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  // V24: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V22: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V24: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V22: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V24: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
   );
 
-  // V22: Cho phép gõ bình thường trong ô login/register/upload.
+  // V24: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -1163,24 +1324,36 @@ function getPatchedIndexHtml() {
 // =================== WEB SERVER ===================
 function startWebServer() {
   const app = express();
+  if (helmet) app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+  if (cors && CONFIG.corsOrigin) app.use(cors({ origin: CONFIG.corsOrigin === '*' ? true : CONFIG.corsOrigin, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api/', rateLimitMiddleware('api', CONFIG.apiRateLimit));
   ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir);
 
   app.get('/api/me', (req, res) => res.json({ user: db.publicUser(requireUser(req, null)) }));
-  app.post('/api/register', (req, res) => { try { const u = db.register(req.body.username, req.body.password); res.json({ success: true, user: db.publicUser(u) }); } catch (e) { res.status(400).json({ error: e.message }); } });
-  app.post('/api/login', (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user) }); } catch (e) { res.status(401).json({ error: e.message }); } });
+  app.post('/api/register', rateLimitMiddleware('auth-register', CONFIG.authRateLimit), (req, res) => { try { const u = db.register(req.body.username, req.body.password, getIp(req)); res.json({ success: true, user: db.publicUser(u) }); } catch (e) { res.status(400).json({ error: e.message }); } });
+  app.post('/api/login', rateLimitMiddleware('auth-login', CONFIG.authRateLimit), (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); if (CONFIG.sessionPolicy === 'single') { closeUserSockets(user.id, 'logged_in_elsewhere'); stopOtherSessionsForUser(user.id); } setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user), sessionPolicy: CONFIG.sessionPolicy }); } catch (e) { res.status(401).json({ error: e.message }); } });
   app.post('/api/logout', (req, res) => { db.logout(parseCookies(req).fj2me_sid); clearCookie(res, 'fj2me_sid'); res.json({ success: true }); });
+  app.get('/api/queue', (req, res) => res.json({ success: true, queue: startQueue.status(), activeSessions: emulatorSessions.size, limits: { maxActiveSessions: CONFIG.maxActiveSessions, maxWsPerIp: CONFIG.maxWsPerIp, maxClientsPerInstance: CONFIG.maxClientsPerInstance } }));
+  app.get('/api/storage', (req, res) => {
+    const user = requireUser(req, res); if (!user) return;
+    const userBytes = getUserStorageBytes(user.id);
+    res.json({ success: true, userBytes, userMb: +(userBytes/1024/1024).toFixed(2), maxUserStorageMb: CONFIG.maxUserStorageMb, uploadsBytes: dirSizeBytes(CONFIG.uploadsDir), totalDataBytes: dirSizeBytes(CONFIG.dataDir) });
+  });
+  app.post('/api/admin/cleanup', (req, res) => { const user = requireUser(req, res); if (!user) return; runStorageCleanup(); res.json({ success: true }); });
 
   const storage = multer.diskStorage({ destination: (req, file, cb) => cb(null, CONFIG.uploadsDir), filename: (req, file, cb) => cb(null, `game_${Date.now()}_${Math.random().toString(36).slice(2)}${path.extname(file.originalname) || '.jar'}`) });
-  const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
-  app.post('/upload', upload.single('jar'), async (req, res) => {
+  const upload = multer({ storage, limits: { fileSize: CONFIG.maxUploadMb * 1024 * 1024 } });
+  app.post('/upload', rateLimitMiddleware('upload', CONFIG.uploadRateLimit), upload.single('jar'), async (req, res) => {
     const user = requireUser(req, res); if (!user) return;
     if (!req.file) return res.status(400).json({ error: 'Không có file' });
     try {
+      enforceUserStorageQuota(user.id);
+      enforceTotalStorageQuota();
       const jarPath = path.resolve(req.file.path);
       const gameHash = sha1File(jarPath);
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V22: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
+      // V24: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
       // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
       stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
       const sess = getOrCreateSession(user, gameHash, jarPath);
@@ -1192,7 +1365,7 @@ function startWebServer() {
       }
       sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
       await sess.start();
-      // V22: bind các WebSocket đang mở của user này vào session mới.
+      // V24: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -1200,7 +1373,7 @@ function startWebServer() {
         });
       }
       res.json({ success: true, gameHash, jar: req.file.filename, user: db.publicUser(user), dataDir: sess.dataDir });
-    } catch (e) { console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
+    } catch (e) { if (req.file && req.file.path) removePathSafe(req.file.path); console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
   });
 
   app.get('/audio/:id.webm', (req, res) => {
@@ -1217,7 +1390,7 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}`);
+  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
@@ -1244,5 +1417,5 @@ function startWebServer() {
 }
 
 // =================== MAIN ===================
-async function main() { ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir); validateRuntimePaths(); startWebServer(); }
+async function main() { ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir); validateRuntimePaths(); runStorageCleanup(); setInterval(runStorageCleanup, CONFIG.cleanupIntervalMs); startWebServer(); }
 main().catch(err => { console.error('Lỗi nghiêm trọng:', err); process.exit(1); });

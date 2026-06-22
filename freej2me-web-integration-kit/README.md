@@ -148,3 +148,115 @@ WS   /ws/:instanceId
 ```
 
 Dev tự quản login/map phím/canvas, bridge chỉ nhận JAR và xuất frame/audio.
+
+## V21 Sharp WebP + FFmpeg Opus
+
+V21 supports optional `sharp` for WebP video frames and `ffmpeg` for Opus audio.
+
+### Windows
+
+Put ffmpeg here:
+
+```txt
+freej2me-lr-web-bridge/tools/ffmpeg.exe
+```
+
+Run:
+
+```bat
+scripts\run-windows-best.bat
+```
+
+### Codespaces/Linux
+
+```bash
+sudo apt update
+sudo apt install -y openjdk-11-jre-headless ffmpeg
+scripts/run-codespace-best.sh
+```
+
+### Manual config
+
+```bash
+npm install sharp
+export VIDEO_CODEC=webp
+export WEBP_QUALITY=48
+export WEBP_EFFORT=0
+export AUDIO_CODEC=opus
+export OPUS_BITRATE=64k
+export FFMPEG_PATH=ffmpeg
+npm start
+```
+
+If WebP uses too much CPU, fallback:
+
+```bash
+export VIDEO_CODEC=rgb565
+export STREAM_SCALE=2
+```
+
+## V22 auto shutdown
+
+To avoid emulator processes running forever after a browser tab closes:
+
+```bash
+export NO_CLIENT_SHUTDOWN_MS=5000
+```
+
+Optional aggressive idle input shutdown:
+
+```bash
+export INPUT_IDLE_SHUTDOWN_MS=0
+```
+
+Keep input idle disabled unless you really want to kill sessions with no key/touch activity.
+
+## V23 security / queue guard
+
+V23 adds default protection for public demos:
+
+```bash
+export SESSION_POLICY=single          # one active login/device per account
+export MAX_ACTIVE_SESSIONS=8
+export START_CONCURRENCY=1            # Java starts at a time
+export QUEUE_MAX_SIZE=16
+export MAX_WS_PER_IP=8
+export MAX_CLIENTS_PER_INSTANCE=2
+export MAX_ACCOUNTS_PER_IP=5
+export AUTH_RATE_LIMIT=20
+export UPLOAD_RATE_LIMIT=6
+export API_RATE_LIMIT=180
+export WS_RATE_LIMIT=60
+export RATE_LIMIT_WINDOW_MS=60000
+export NO_CLIENT_SHUTDOWN_MS=5000
+```
+
+Optional packages:
+
+```bash
+npm install sharp helmet cors
+```
+
+`bull`/Redis is recommended only for multi-server production. The default single-node build uses an in-memory queue to avoid extra services.
+
+## V24 storage/quota cleanup
+
+V24 adds disk protection:
+
+```bash
+export MAX_UPLOAD_MB=50
+export MAX_USER_STORAGE_MB=500
+export MAX_TOTAL_STORAGE_MB=0          # 0 disables global quota
+export UPLOAD_RETENTION_HOURS=24
+export TEMP_RETENTION_HOURS=6
+export CLEANUP_INTERVAL_MS=600000
+```
+
+APIs:
+
+```txt
+GET  /api/storage        # logged-in user's storage usage
+POST /api/admin/cleanup  # logged-in manual cleanup trigger
+```
+
+Cleanup removes old temporary uploads and obvious temp/log files. It does **not** delete save/runtime roots aggressively, to avoid destroying player saves.

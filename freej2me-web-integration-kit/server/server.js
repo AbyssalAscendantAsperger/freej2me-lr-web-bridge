@@ -20,6 +20,13 @@ const express = require('express');
 const multer = require('multer');
 const http = require('http');
 const WebSocket = require('ws');
+let sharp = null;
+try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
+let helmet = null, cors = null, expressRateLimit = null, systeminformation = null;
+try { helmet = require('helmet'); } catch(e) {}
+try { cors = require('cors'); } catch(e) {}
+try { expressRateLimit = require('express-rate-limit'); } catch(e) {}
+try { systeminformation = require('systeminformation'); } catch(e) {}
 
 // =================== CONFIG ===================
 function loadConfig() {
@@ -151,15 +158,49 @@ function loadConfig() {
     // Or set VIDEO_CODEC=rgba|rgb565|rgb332 explicitly.
     imageQuality: Math.max(1, Math.min(100, intConfig('IMAGE_QUALITY', fileConfig.imageQuality, 65))),
     videoCodec: String(process.env.VIDEO_CODEC || fileConfig.videoCodec || '').toLowerCase(),
+    webpQuality: Math.max(1, Math.min(100, intConfig('WEBP_QUALITY', fileConfig.webpQuality, 55))),
+    webpEffort: Math.max(0, Math.min(6, intConfig('WEBP_EFFORT', fileConfig.webpEffort, 0))),
     maxWsBufferedAmount: intConfig('MAX_WS_BUFFERED', fileConfig.maxWsBufferedAmount, 512 * 1024),
     wsCompression: boolConfig('WS_COMPRESSION', fileConfig.wsCompression, false),
     audioPipe: boolConfig('AUDIO_PIPE', fileConfig.audioPipe, true),
 
     frameResyncLog: boolConfig('FRAME_RESYNC_LOG', fileConfig.frameResyncLog, false),
     audioDebugLog: boolConfig('AUDIO_DEBUG_LOG', fileConfig.audioDebugLog, false),
+    // V24: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
+    audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, 40))),
+    audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, 180))),
+    // V24: optional Opus/WebM HTTP audio stream. Requires ffmpeg.
+    audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || 'opus').toLowerCase(),
+    opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || '64k'),
+    ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
 
     maxActiveSessions: intConfig('MAX_ACTIVE_SESSIONS', fileConfig.maxActiveSessions, 8),
     sessionIdleMs: intConfig('SESSION_IDLE_MS', fileConfig.sessionIdleMs, 10 * 60 * 1000),
+    noClientShutdownMs: intConfig('NO_CLIENT_SHUTDOWN_MS', fileConfig.noClientShutdownMs, 5000),
+    inputIdleShutdownMs: intConfig('INPUT_IDLE_SHUTDOWN_MS', fileConfig.inputIdleShutdownMs, 0),
+
+    // V23 security/resource guard defaults. Safe for public demo; devs can tune by env/config.
+    sessionPolicy: String(process.env.SESSION_POLICY || fileConfig.sessionPolicy || 'single').toLowerCase(), // single|multi
+    requireLogin: boolConfig('REQUIRE_LOGIN', fileConfig.requireLogin, true),
+    maxAccountsPerIp: intConfig('MAX_ACCOUNTS_PER_IP', fileConfig.maxAccountsPerIp, 5),
+    maxWsPerIp: intConfig('MAX_WS_PER_IP', fileConfig.maxWsPerIp, 8),
+    maxClientsPerInstance: intConfig('MAX_CLIENTS_PER_INSTANCE', fileConfig.maxClientsPerInstance, 2),
+    queueMaxSize: intConfig('QUEUE_MAX_SIZE', fileConfig.queueMaxSize, 16),
+    startConcurrency: intConfig('START_CONCURRENCY', fileConfig.startConcurrency, Math.max(1, Math.min(2, Math.floor(require('os').cpus().length / 2)))),
+    authRateLimit: intConfig('AUTH_RATE_LIMIT', fileConfig.authRateLimit, 20),
+    uploadRateLimit: intConfig('UPLOAD_RATE_LIMIT', fileConfig.uploadRateLimit, 6),
+    apiRateLimit: intConfig('API_RATE_LIMIT', fileConfig.apiRateLimit, 180),
+    wsRateLimit: intConfig('WS_RATE_LIMIT', fileConfig.wsRateLimit, 60),
+    rateLimitWindowMs: intConfig('RATE_LIMIT_WINDOW_MS', fileConfig.rateLimitWindowMs, 60 * 1000),
+    corsOrigin: process.env.CORS_ORIGIN || fileConfig.corsOrigin || '',
+
+    // V24 storage/quota cleanup.
+    maxUploadMb: intConfig('MAX_UPLOAD_MB', fileConfig.maxUploadMb, 50),
+    maxUserStorageMb: intConfig('MAX_USER_STORAGE_MB', fileConfig.maxUserStorageMb, 500),
+    maxTotalStorageMb: intConfig('MAX_TOTAL_STORAGE_MB', fileConfig.maxTotalStorageMb, 0), // 0 = disabled
+    uploadRetentionHours: intConfig('UPLOAD_RETENTION_HOURS', fileConfig.uploadRetentionHours, 24),
+    tempRetentionHours: intConfig('TEMP_RETENTION_HOURS', fileConfig.tempRetentionHours, 6),
+    cleanupIntervalMs: intConfig('CLEANUP_INTERVAL_MS', fileConfig.cleanupIntervalMs, 10 * 60 * 1000),
 
     uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, 'uploads'),
     dataDir: process.env.DATA_DIR || path.join(__dirname, 'freej2me_data'),
@@ -168,12 +209,21 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
-if (!['rgba', 'rgb565', 'rgb332'].includes(CONFIG.videoCodec)) {
+if (!['rgba', 'rgb565', 'rgb332', 'webp'].includes(CONFIG.videoCodec)) {
   CONFIG.videoCodec = CONFIG.imageQuality >= 90 ? 'rgba' : (CONFIG.imageQuality >= 45 ? 'rgb565' : 'rgb332');
+}
+if (CONFIG.videoCodec === 'webp' && !sharp) {
+  console.warn('[Video] VIDEO_CODEC=webp nhưng sharp chưa cài được. Fallback rgb565. Chạy: npm install sharp');
+  CONFIG.videoCodec = 'rgb565';
+}
+if (!CONFIG.ffmpegPath || CONFIG.ffmpegPath === 'ffmpeg') {
+  const localFfmpeg = path.join(__dirname, 'tools', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+  if (fs.existsSync(localFfmpeg)) CONFIG.ffmpegPath = localFfmpeg;
 }
 const AUDIO_MAGIC = Buffer.from('FJ2A');
 let wss = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
+const publicSessionIds = new Map(); // publicId -> EmulatorSession for /audio/:id.webm
 
 // =================== UTILS ===================
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
@@ -191,6 +241,134 @@ function parseCookies(req) {
   });
   return out;
 }
+function getIp(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return req.socket && req.socket.remoteAddress || 'unknown';
+}
+
+const memoryBuckets = new Map();
+function memoryRateLimit(key, limit, windowMs) {
+  const t = now();
+  let b = memoryBuckets.get(key);
+  if (!b || t >= b.resetAt) { b = { count: 0, resetAt: t + windowMs }; memoryBuckets.set(key, b); }
+  b.count++;
+  return { ok: b.count <= limit, count: b.count, resetAt: b.resetAt, retryAfterMs: Math.max(0, b.resetAt - t) };
+}
+function rateLimitMiddleware(name, limitGetter) {
+  return (req, res, next) => {
+    const limit = typeof limitGetter === 'function' ? limitGetter(req) : limitGetter;
+    const ip = getIp(req);
+    const r = memoryRateLimit(`${name}:${ip}`, limit, CONFIG.rateLimitWindowMs);
+    res.setHeader('X-RateLimit-Limit', String(limit));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, limit - r.count)));
+    if (!r.ok) return res.status(429).json({ error: 'rate_limited', retryAfterMs: r.retryAfterMs });
+    next();
+  };
+}
+
+function countOpenWsForIp(ip) {
+  if (!wss) return 0;
+  let n = 0;
+  wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN && ws._ip === ip) n++; });
+  return n;
+}
+function closeUserSockets(userId, reason = 'session_invalidated') {
+  if (!wss) return;
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN && ws._userId === userId) {
+      try { ws.send(JSON.stringify({ type: 'error', error: reason })); } catch(e) {}
+      try { ws.close(); } catch(e) {}
+    }
+  });
+}
+
+class StartQueue {
+  constructor(concurrency, maxSize) { this.concurrency = concurrency; this.maxSize = maxSize; this.running = 0; this.queue = []; }
+  add(task) {
+    if (this.queue.length + this.running >= this.maxSize) return Promise.reject(new Error('Server queue đầy, thử lại sau'));
+    return new Promise((resolve, reject) => { this.queue.push({ task, resolve, reject }); this.pump(); });
+  }
+  pump() {
+    while (this.running < this.concurrency && this.queue.length) {
+      const item = this.queue.shift(); this.running++;
+      Promise.resolve().then(item.task).then(item.resolve, item.reject).finally(() => { this.running--; this.pump(); });
+    }
+  }
+  status() { return { running: this.running, queued: this.queue.length, concurrency: this.concurrency, maxSize: this.maxSize }; }
+}
+const startQueue = new StartQueue(CONFIG.startConcurrency, CONFIG.queueMaxSize);
+
+function dirSizeBytes(dir) {
+  let total = 0;
+  try {
+    if (!fs.existsSync(dir)) return 0;
+    const st = fs.statSync(dir);
+    if (st.isFile()) return st.size;
+    for (const name of fs.readdirSync(dir)) total += dirSizeBytes(path.join(dir, name));
+  } catch (e) {}
+  return total;
+}
+function removePathSafe(p) {
+  try {
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+    return true;
+  } catch (e) { console.warn('[Cleanup] remove failed', p, e.message); return false; }
+}
+function cleanupUploads() {
+  const cutoff = now() - CONFIG.uploadRetentionHours * 3600 * 1000;
+  let removed = 0, bytes = 0;
+  try {
+    if (!fs.existsSync(CONFIG.uploadsDir)) return { removed, bytes };
+    for (const name of fs.readdirSync(CONFIG.uploadsDir)) {
+      const fp = path.join(CONFIG.uploadsDir, name);
+      const st = fs.statSync(fp);
+      if (st.mtimeMs < cutoff) { bytes += st.isFile() ? st.size : dirSizeBytes(fp); if (removePathSafe(fp)) removed++; }
+    }
+  } catch (e) { console.warn('[Cleanup] uploads:', e.message); }
+  if (removed) console.log(`[Cleanup] uploads removed=${removed}, bytes=${bytes}`);
+  return { removed, bytes };
+}
+function getUserDataDir(userId) { return path.join(CONFIG.dataDir, 'users', safeName(userId)); }
+function getUserStorageBytes(userId) { return dirSizeBytes(getUserDataDir(userId)); }
+function enforceUserStorageQuota(userId) {
+  if (!CONFIG.maxUserStorageMb || CONFIG.maxUserStorageMb <= 0) return;
+  const used = getUserStorageBytes(userId);
+  const max = CONFIG.maxUserStorageMb * 1024 * 1024;
+  if (used > max) throw new Error(`User storage quota exceeded: ${(used/1024/1024).toFixed(1)}MB / ${CONFIG.maxUserStorageMb}MB`);
+}
+function enforceTotalStorageQuota() {
+  if (!CONFIG.maxTotalStorageMb || CONFIG.maxTotalStorageMb <= 0) return;
+  const used = dirSizeBytes(CONFIG.dataDir);
+  const max = CONFIG.maxTotalStorageMb * 1024 * 1024;
+  if (used > max) throw new Error(`Total storage quota exceeded: ${(used/1024/1024).toFixed(1)}MB / ${CONFIG.maxTotalStorageMb}MB`);
+}
+function cleanupTempRuntime() {
+  // Conservative cleanup: remove obvious temp files/dirs older than TEMP_RETENTION_HOURS, never delete user save runtime root wholesale.
+  const cutoff = now() - CONFIG.tempRetentionHours * 3600 * 1000;
+  let removed = 0, bytes = 0;
+  const candidates = ['tmp', 'temp', 'cache'];
+  function walk(dir) {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const name of fs.readdirSync(dir)) {
+        const fp = path.join(dir, name); const st = fs.statSync(fp);
+        if (st.isDirectory()) {
+          if (candidates.includes(name.toLowerCase()) && st.mtimeMs < cutoff) { bytes += dirSizeBytes(fp); if (removePathSafe(fp)) removed++; }
+          else walk(fp);
+        } else if ((name.endsWith('.tmp') || name.endsWith('.log')) && st.mtimeMs < cutoff) { bytes += st.size; if (removePathSafe(fp)) removed++; }
+      }
+    } catch(e) {}
+  }
+  walk(path.join(CONFIG.dataDir, 'users'));
+  if (removed) console.log(`[Cleanup] temp removed=${removed}, bytes=${bytes}`);
+  return { removed, bytes };
+}
+function runStorageCleanup() {
+  cleanupUploads(); cleanupTempRuntime();
+}
+
+
 function setCookie(res, name, value, opts = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, 'Path=/', 'SameSite=Lax'];
   if (opts.httpOnly !== false) parts.push('HttpOnly');
@@ -252,23 +430,27 @@ class JsonDB {
   }
   save() { fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2)); }
   publicUser(user) { return user ? { id: user.id, username: user.username, createdAt: user.createdAt } : null; }
-  register(username, password) {
+  register(username, password, ip = 'unknown') {
     username = String(username || '').trim().toLowerCase();
     if (!/^[a-z0-9_.-]{3,32}$/.test(username)) throw new Error('Username 3-32 ký tự, chỉ a-z 0-9 _ . -');
     if (!password || String(password).length < 4) throw new Error('Password tối thiểu 4 ký tự');
     if (this.data.users[username]) throw new Error('Username đã tồn tại');
+    const ipCount = Object.values(this.data.users).filter(u => u.createdIp === ip).length;
+    if (CONFIG.maxAccountsPerIp > 0 && ipCount >= CONFIG.maxAccountsPerIp) throw new Error('IP này đã tạo quá nhiều tài khoản');
     const salt = crypto.randomBytes(16).toString('hex');
-    const user = { id: randomId('u_'), username, salt, passwordHash: sha256(salt + ':' + password), createdAt: now() };
+    const user = { id: randomId('u_'), username, salt, passwordHash: sha256(salt + ':' + password), createdAt: now(), createdIp: ip };
     this.data.users[username] = user; this.save(); return user;
   }
   login(username, password) {
     username = String(username || '').trim().toLowerCase();
     const user = this.data.users[username];
     if (!user || user.passwordHash !== sha256(user.salt + ':' + password)) throw new Error('Sai username hoặc password');
+    if (CONFIG.sessionPolicy === 'single') this.invalidateUserSessions(user.id);
     const sid = randomId('sid_');
     this.data.sessions[sid] = { userId: user.id, username: user.username, createdAt: now(), expiresAt: now() + 30 * 24 * 3600 * 1000 };
     this.save(); return { sid, user };
   }
+  invalidateUserSessions(userId) { for (const [sid, sess] of Object.entries(this.data.sessions)) if (sess.userId === userId) delete this.data.sessions[sid]; }
   logout(sid) { if (sid && this.data.sessions[sid]) { delete this.data.sessions[sid]; this.save(); } }
   getUserBySession(sid) {
     const sess = this.data.sessions[sid];
@@ -343,13 +525,23 @@ class EmulatorSession {
   constructor({ user, gameHash, jarPath }) {
     this.user = user; this.userId = user.id; this.username = user.username; this.gameHash = gameHash; this.jarPath = jarPath;
     this.key = `${this.userId}:${gameHash}`;
+    this.publicId = randomId('s_');
+    publicSessionIds.set(this.publicId, this);
     this.clients = new Set();
+    this.audioHttpClients = new Set();
+    this.ffmpeg = null;
+    this.ffmpegReady = false;
+    this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
     this.process = null; this.stdoutReader = null; this.stdin = null;
     this.isRunning = false; this.frameLoopActive = false;
     this.emuFrameWidth = CONFIG.width; this.emuFrameHeight = CONFIG.height;
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
-    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
+    this.stopOpusEncoder(); this.opusAudioEnabled = CONFIG.audioCodec === 'opus'; this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
     this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
+    this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 };
+    this.audioPcmChunks = [];
+    this.audioPcmBytes = 0;
+    this.audioFlushTimer = null;
     this.lastActivity = now();
     this.dataDir = path.join(CONFIG.dataDir, 'users', safeName(this.userId), 'games', gameHash, 'runtime');
     ensureDir(this.dataDir);
@@ -367,17 +559,62 @@ class EmulatorSession {
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
   getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...extra }; }
   getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) { return { width: Math.max(1, Math.floor(width / CONFIG.streamScale)), height: Math.max(1, Math.floor(height / CONFIG.streamScale)) }; }
-  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }); }
+  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }); }
+
+  cancelNoClientShutdown() {
+    if (this.noClientTimer) clearTimeout(this.noClientTimer);
+    this.noClientTimer = null;
+  }
+
+  scheduleNoClientShutdown(reason = 'no clients') {
+    this.cancelNoClientShutdown();
+    if (CONFIG.noClientShutdownMs <= 0) return;
+    this.noClientTimer = setTimeout(() => {
+      if (this.clients.size === 0) {
+        console.log(`[SESSION ${this.username}] auto shutdown: ${reason}, idle ${CONFIG.noClientShutdownMs}ms`);
+        this.cleanupProcess();
+        emulatorSessions.delete(this.key);
+        if (this.publicId) publicSessionIds.delete(this.publicId);
+      }
+    }, CONFIG.noClientShutdownMs);
+  }
+
+  startInputIdleWatchdog() {
+    if (this.inputIdleTimer || CONFIG.inputIdleShutdownMs <= 0) return;
+    this.inputIdleTimer = setInterval(() => {
+      if (!this.isRunning || this.clients.size === 0) return;
+      if (now() - this.lastInputAt >= CONFIG.inputIdleShutdownMs) {
+        console.log(`[SESSION ${this.username}] input idle shutdown after ${CONFIG.inputIdleShutdownMs}ms`);
+        this.broadcastJson({ type: 'status', state: 'input-idle-shutdown' });
+        this.cleanupProcess();
+        emulatorSessions.delete(this.key);
+        if (this.publicId) publicSessionIds.delete(this.publicId);
+      }
+    }, Math.max(1000, Math.min(CONFIG.inputIdleShutdownMs, 5000)));
+  }
+
+  markInputActivity() {
+    this.lastInputAt = now();
+    this.touch();
+  }
 
   addClient(ws) {
     this.touch();
+    this.cancelNoClientShutdown();
     detachClientFromOtherSessions(ws, this);
+    if (CONFIG.maxClientsPerInstance > 0 && this.clients.size >= CONFIG.maxClientsPerInstance) { try { ws.send(JSON.stringify({ type: 'error', error: 'too_many_clients_for_instance' })); } catch(e) {} try { ws.close(); } catch(e) {} return; }
     this.clients.add(ws);
     ws._emuSession = this;
-    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }));
+    console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
+    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null, audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm' }));
+    ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
-    ws.on('close', () => { this.clients.delete(ws); this.touch(); });
+    ws.on('close', () => {
+      this.clients.delete(ws);
+      this.touch();
+      if (this.clients.size === 0) this.scheduleNoClientShutdown('last websocket closed');
+    });
   }
 
   countReadyClients() {
@@ -386,11 +623,29 @@ class EmulatorSession {
     return n;
   }
 
-  convertRgb24ToVideoBuffer(rgb24, width, height) {
+  async convertRgb24ToVideoBuffer(rgb24, width, height) {
     const scale = Math.max(1, CONFIG.streamScale | 0);
     const outWidth = scale <= 1 ? width : Math.max(1, Math.floor(width / scale));
     const outHeight = scale <= 1 ? height : Math.max(1, Math.floor(height / scale));
     const codec = CONFIG.videoCodec;
+
+    // Optional WebP via sharp. Excellent for bandwidth, costs CPU/latency.
+    if (codec === 'webp' && sharp) {
+      const raw = Buffer.allocUnsafe(outWidth * outHeight * 3);
+      let dst = 0;
+      for (let y = 0; y < outHeight; y++) {
+        const srcRow = (y * scale * width) * 3;
+        for (let x = 0; x < outWidth; x++) {
+          const src = srcRow + (x * scale * 3);
+          raw[dst++] = rgb24[src];
+          raw[dst++] = rgb24[src + 1];
+          raw[dst++] = rgb24[src + 2];
+        }
+      }
+      return await sharp(raw, { raw: { width: outWidth, height: outHeight, channels: 3 } })
+        .webp({ quality: CONFIG.webpQuality, effort: CONFIG.webpEffort, smartSubsample: false })
+        .toBuffer();
+    }
 
     if (codec === 'rgb332') {
       const out = Buffer.allocUnsafe(outWidth * outHeight);
@@ -422,7 +677,6 @@ class EmulatorSession {
       return out;
     }
 
-    // rgba 32-bit fallback / best quality.
     const out = Buffer.allocUnsafe(outWidth * outHeight * 4);
     let dst = 0;
     for (let y = 0; y < outHeight; y++) {
@@ -459,6 +713,134 @@ class EmulatorSession {
     throw new Error('Frame loop stopped');
   }
 
+  startOpusEncoder() {
+    if (!this.opusAudioEnabled || !this.currentAudioFormat || this.ffmpeg) return;
+    const f = this.currentAudioFormat;
+    if (f.bits !== 16 || !f.signed) {
+      console.warn(`[AUDIO ${this.username}] Opus fallback: unsupported PCM format`, f);
+      this.opusAudioEnabled = false;
+      return;
+    }
+    const inputFmt = f.bigEndian ? 's16be' : 's16le';
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', inputFmt,
+      '-ar', String(f.sampleRate || 44100),
+      '-ac', String(f.channels || 2),
+      '-i', 'pipe:0',
+      '-vn',
+      '-c:a', 'libopus',
+      '-b:a', CONFIG.opusBitrate,
+      '-application', 'audio',
+      '-frame_duration', '20',
+      '-vbr', 'on',
+      '-compression_level', '10',
+      '-f', 'webm',
+      '-cluster_time_limit', '100',
+      '-flush_packets', '1',
+      'pipe:1',
+    ];
+    console.log(`[AUDIO ${this.username}] starting ffmpeg opus ${CONFIG.opusBitrate}: ${CONFIG.ffmpegPath} ${args.join(' ')}`);
+    try {
+      this.ffmpeg = spawn(CONFIG.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      this.ffmpegReady = true;
+      this.ffmpeg.stdout.on('data', (chunk) => {
+        for (const res of Array.from(this.audioHttpClients)) {
+          try { res.write(chunk); } catch (e) { this.audioHttpClients.delete(res); }
+        }
+      });
+      this.ffmpeg.stderr.on('data', (d) => {
+        const t = d.toString().trim();
+        if (t) console.warn(`[FFMPEG ${this.username}]`, t);
+      });
+      this.ffmpeg.on('exit', (code) => {
+        console.warn(`[AUDIO ${this.username}] ffmpeg exited code=${code}`);
+        this.ffmpeg = null; this.ffmpegReady = false;
+      });
+      this.ffmpeg.on('error', (err) => {
+        console.warn(`[AUDIO ${this.username}] ffmpeg error: ${err.message}; fallback PCM websocket`);
+        this.opusAudioEnabled = false; this.ffmpeg = null; this.ffmpegReady = false;
+      });
+    } catch (e) {
+      console.warn(`[AUDIO ${this.username}] cannot start ffmpeg: ${e.message}; fallback PCM websocket`);
+      this.opusAudioEnabled = false; this.ffmpeg = null; this.ffmpegReady = false;
+    }
+  }
+
+  writeOpusPcm(payload) {
+    if (!this.opusAudioEnabled) return false;
+    this.startOpusEncoder();
+    if (!this.ffmpeg || !this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed) return false;
+    try { this.ffmpeg.stdin.write(payload); return true; }
+    catch (e) { console.warn(`[AUDIO ${this.username}] ffmpeg stdin write failed:`, e.message); return false; }
+  }
+
+  addAudioHttpClient(res) {
+    if (!this.opusAudioEnabled) return false;
+    res.writeHead(200, {
+      'Content-Type': 'audio/webm; codecs=opus',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    this.audioHttpClients.add(res);
+    res.on('close', () => this.audioHttpClients.delete(res));
+    res.on('error', () => this.audioHttpClients.delete(res));
+    return true;
+  }
+
+  stopOpusEncoder() {
+    for (const res of Array.from(this.audioHttpClients)) {
+      try { res.end(); } catch (e) {}
+    }
+    this.audioHttpClients.clear();
+    if (this.ffmpeg) {
+      try { this.ffmpeg.stdin.end(); } catch (e) {}
+      try { this.ffmpeg.kill('SIGTERM'); } catch (e) {}
+    }
+    this.ffmpeg = null; this.ffmpegReady = false;
+  }
+
+  makeAudioPcmPacket(payload) {
+    const h = Buffer.allocUnsafe(9);
+    h.write('FJ2A', 0, 4, 'ascii');
+    h[4] = 2;
+    h.writeUInt32BE(payload.length, 5);
+    return Buffer.concat([h, payload]);
+  }
+
+  audioBytesPerMs() {
+    const f = this.currentAudioFormat;
+    if (!f || !f.sampleRate || !f.channels || !f.bits) return 4096;
+    return Math.max(1, Math.ceil(f.sampleRate * f.channels * (f.bits / 8) / 1000));
+  }
+
+  flushAudioPcm() {
+    if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
+    if (!this.audioPcmBytes || this.audioPcmChunks.length === 0) return;
+    const payload = this.audioPcmChunks.length === 1 ? this.audioPcmChunks[0] : Buffer.concat(this.audioPcmChunks, this.audioPcmBytes);
+    this.audioPcmChunks = [];
+    this.audioPcmBytes = 0;
+    const packet = this.makeAudioPcmPacket(payload);
+    this.broadcast(packet, { binary: true, compress: false });
+  }
+
+  queueAudioPcm(payload) {
+    if (!payload || payload.length <= 0) return;
+    this.audioPcmChunks.push(Buffer.from(payload));
+    this.audioPcmBytes += payload.length;
+    const targetBytes = this.audioBytesPerMs() * CONFIG.audioPacketMs;
+    if (this.audioPcmBytes >= targetBytes) {
+      this.flushAudioPcm();
+      return;
+    }
+    if (!this.audioFlushTimer) {
+      this.audioFlushTimer = setTimeout(() => this.flushAudioPcm(), CONFIG.audioPacketMs);
+    }
+  }
+
   logAudioText(buf) {
     if (!buf || !buf.length) return;
     const text = buf.toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]+/g, '').trim();
@@ -480,9 +862,13 @@ class EmulatorSession {
           const packet = Buffer.from(this.audioPipeBuffer.slice(0, 13));
           this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
           this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
+          this.flushAudioPcm();
+          this.stopOpusEncoder();
+          this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
           console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
-          this.broadcast(packet, { binary: true, compress: false });
-          this.broadcastJson(this.getAudioStatus({ event: 'format' }));
+          if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
+          this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
+          if (this.opusAudioEnabled) this.startOpusEncoder();
           this.audioPipeBuffer = this.audioPipeBuffer.slice(13); continue;
         }
         if (type === 2) {
@@ -490,10 +876,10 @@ class EmulatorSession {
           const len = this.audioPipeBuffer.readUInt32BE(5);
           if (len > 1024 * 1024) { this.audioPipeBuffer = this.audioPipeBuffer.slice(1); continue; }
           const total = 9 + len; if (this.audioPipeBuffer.length < total) return;
-          const packet = Buffer.from(this.audioPipeBuffer.slice(0, total));
+          const payload = Buffer.from(this.audioPipeBuffer.slice(9, total));
           this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}`);
-          this.broadcast(packet, { binary: true, compress: false });
+          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${CONFIG.audioPacketMs}ms`);
+          if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
           this.audioPipeBuffer = this.audioPipeBuffer.slice(total); continue;
         }
         this.audioPipeBuffer = this.audioPipeBuffer.slice(1);
@@ -503,6 +889,11 @@ class EmulatorSession {
 
   cleanupProcess() {
     this.frameLoopActive = false; this.isRunning = false;
+    this.cancelNoClientShutdown();
+    if (this.inputIdleTimer) { clearInterval(this.inputIdleTimer); this.inputIdleTimer = null; }
+    this.flushAudioPcm();
+    this.stopOpusEncoder();
+    if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     if (this.process && !this.process.killed) { try { this.process.kill('SIGTERM'); } catch (e) {} }
     this.process = null; this.stdoutReader = null; this.stdin = null;
   }
@@ -517,7 +908,7 @@ class EmulatorSession {
     const jvmArgs = [getEncodingJvmArg(encodingName), '-Djava.awt.headless=true', ...(CONFIG.audioPipe ? ['-Dfreej2me.audioPipe=1'] : []), '-jar', CONFIG.freej2meJar];
     const proc = spawn(CONFIG.javaPath, [...jvmArgs, ...buildArgs()], { stdio: ['pipe', 'pipe', 'pipe'], cwd: this.dataDir });
     this.process = proc; this.stdin = proc.stdin; this.stdoutReader = new StdoutReader(proc.stdout);
-    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null; this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
+    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null; this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 }; this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 }; this.audioPcmChunks = []; this.audioPcmBytes = 0; if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     this.attachAudioPipe(proc.stderr);
     proc.on('exit', code => { if (this.process === proc) { console.log(`[EMU ${this.username}] exited ${code}`); this.cleanupProcess(); } });
     proc.on('error', err => { if (this.process === proc) { console.error(`[EMU ${this.username}] error:`, err.message); this.cleanupProcess(); } });
@@ -533,7 +924,10 @@ class EmulatorSession {
     await new Promise(r => setTimeout(r, 1000));
     this.sendFrameRequest();
     this.isRunning = true; this.frameLoopActive = true;
+    this.lastInputAt = now();
+    this.startInputIdleWatchdog();
     this.broadcastConfig();
+    this.broadcastJson({ type: 'status', state: 'running', gameHash: this.gameHash });
     this.startFrameLoop();
     setTimeout(() => { if (this.isRunning && CONFIG.audioPipe && this.audioStats.formatPackets === 0) this.broadcastJson(this.getAudioStatus({ event: 'timeout-no-audio', warning: 'no FJ2A audio packet after 5s' })); }, 5000);
   }
@@ -557,13 +951,15 @@ class EmulatorSession {
         if (dims.width !== this.streamOutWidth || dims.height !== this.streamOutHeight) this.broadcastConfig();
         const rgb24 = await this.stdoutReader.readBytes(frameSize);
         frameNo++;
+        this.videoStats.framesRead++;
+        this.videoStats.lastFrameAt = now();
         if (minFrameInterval > 0) {
           const elapsed = now() - lastFrameTime;
           if (elapsed < minFrameInterval) await new Promise(r => setTimeout(r, minFrameInterval - elapsed));
           lastFrameTime = now();
         }
         if (this.countReadyClients() <= 0) { dropBackpressure++; this.sendFrameRequest(); continue; }
-        const videoBuf = this.convertRgb24ToVideoBuffer(rgb24, width, height);
+        const videoBuf = await this.convertRgb24ToVideoBuffer(rgb24, width, height);
         for (const ws of this.clients) {
           if (ws.readyState === WebSocket.OPEN) {
             if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
@@ -738,6 +1134,18 @@ function getPatchedIndexHtml() {
     const v12LoginFirst = document.getElementById('v12-login-first');
     let gameLoaded = false;
     let shouldConnectWs = false;
+    let wsReconnectTimer = null;
+    let wsConnecting = false;
+    function reconnectWsSoon(delay = 250) {
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = setTimeout(() => {
+        if (!shouldConnectWs) return;
+        try { if (ws && ws.readyState !== WebSocket.CLOSED) ws.close(); } catch(e) {}
+        ws = null;
+        wsConnecting = false;
+        connect();
+      }, delay);
+    }
     function setGameUiVisible(show) {
       gameLoaded = !!show;
       if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
@@ -776,36 +1184,57 @@ function getPatchedIndexHtml() {
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
+    let opusAudioUrl = null;
+    let opusAudioEl = null;
     let videoCodec = 'rgba';
     let imageQuality = 100;
+    const AUDIO_START_BUFFER_SEC = 0.18; // overwritten by server config not needed; stable default for tunnel jitter
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
-    function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'interactive'}); return audioCtx; }
-    function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.12,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.18); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.2);}catch(e){} }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+0.08; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted) browserTestBeep(); } };
+    function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'playback'}); return audioCtx; }
+    function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.16); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.18);}catch(e){} }
+    function startOpusAudio(){ if(!opusAudioUrl) return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+AUDIO_START_BUFFER_SEC; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); startOpusAudio(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted){ audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; browserTestBeep(); startOpusAudio(); } } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ if(msg.audioUrl){ opusAudioUrl = msg.audioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'codec='+(msg.audioCodec||'pcm')+' fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function handleAudioPacket(u8){
-      if(!isAudioPacket(u8)) return false; const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
-      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; return true; }
-      if(type!==2 || u8.length<9) return true; const len=dv.getUint32(5,false); if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
-      const chs=Math.max(1,audioFormat.channels|0), frames=Math.floor(len/(2*chs)); if(frames<=0) return true; const buf=audioCtx.createBuffer(chs,frames,audioFormat.sampleRate||48000); const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
+      if(!isAudioPacket(u8)) return false;
+      const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; if(audioCtx) audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; return true; }
+      if(type!==2 || u8.length<9) return true;
+      const len=dv.getUint32(5,false);
+      if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
+      const chs=Math.max(1,audioFormat.channels|0), frames=Math.floor(len/(2*chs)); if(frames<=0) return true;
+      const buf=audioCtx.createBuffer(chs,frames,audioFormat.sampleRate||48000);
+      const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
       for(let i=0;i<frames;i++){ for(let c=0;c<chs;c++){ let smp=audioFormat.bigEndian?((u8[off]<<8)|u8[off+1]):(u8[off]|(u8[off+1]<<8)); if(audioFormat.signed&&smp>=0x8000)smp-=0x10000; if(!audioFormat.signed)smp-=0x8000; cd[c][i]=Math.max(-1,Math.min(1,smp/32768)); off+=2; } }
-      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination); const n=audioCtx.currentTime; if(!audioNextTime||audioNextTime<n+0.02) audioNextTime=n+0.06; if(audioNextTime>n+0.45) return true; src.start(audioNextTime); audioNextTime+=buf.duration; return true;
+      const nowAudio=audioCtx.currentTime;
+      if(!audioNextTime || audioNextTime < nowAudio + 0.04) audioNextTime = nowAudio + AUDIO_START_BUFFER_SEC;
+      // If backlog grows too much, drop this packet rather than playing old audio late.
+      if(audioNextTime > nowAudio + 0.9) return true;
+      const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination);
+      src.start(audioNextTime); audioNextTime += buf.duration;
+      return true;
     }
 
     // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
     let latestFrame = null, rafPending = false, reusableImageData = null;
+    async function drawWebpFrame(src) {
+      const blob = new Blob([src], { type: 'image/webp' });
+      const bitmap = await createImageBitmap(blob);
+      ctx.drawImage(bitmap, 0, 0, screenWidth, screenHeight);
+      bitmap.close && bitmap.close();
+      return true;
+    }
     function decodeVideoFrameToImageData(src, imageData) {
       const dst = imageData.data;
       const pixels = screenWidth * screenHeight;
-      // V15.1 safety: tự nhận codec theo kích thước packet để tránh đen màn hình
-      // nếu config packet tới muộn hoặc client còn cache codec cũ.
       let codec = videoCodec;
-      if (src.length >= pixels * 4) codec = 'rgba';
-      else if (src.length >= pixels * 2) codec = 'rgb565';
-      else if (src.length >= pixels) codec = 'rgb332';
-
+      if (codec !== 'webp') {
+        if (src.length >= pixels * 4) codec = 'rgba';
+        else if (src.length >= pixels * 2) codec = 'rgb565';
+        else if (src.length >= pixels) codec = 'rgb332';
+      }
       if (codec === 'rgb332') {
         if (src.length < pixels) return false;
         for (let i = 0, j = 0; i < pixels; i++, j += 4) {
@@ -833,33 +1262,43 @@ function getPatchedIndexHtml() {
       dst.set(src.subarray(0, expectedSize));
       return true;
     }
-    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(()=>{ rafPending=false; if(!latestFrame) return; if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); if(!decodeVideoFrameToImageData(latestFrame, reusableImageData)) return; ctx.putImageData(reusableImageData,0,0); frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS ['+videoCodec+' q'+imageQuality+']'; frameCount=0; lastFpsTime=n; } }); }
+    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(async()=>{ rafPending=false; if(!latestFrame) return; try { if(videoCodec === 'webp') { await drawWebpFrame(latestFrame); } else { if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); if(!decodeVideoFrameToImageData(latestFrame, reusableImageData)) return; ctx.putImageData(reusableImageData,0,0); } frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS ['+videoCodec+' q'+imageQuality+']'; frameCount=0; lastFpsTime=n; } } catch(e) { console.warn('draw frame failed', e); } }); }
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V17: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
+  // V24: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
     "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
   );
 
-  // V17: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
-  html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;');
+  // V24: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
+  html = html.replace(
+    "      ws.onopen = () => {\n        isConnected = true;",
+    "      ws.onopen = () => {\n        wsConnecting = false;\n        isConnected = true;"
+  );
+  html = html.replace(
+    "      ws.onclose = () => {\n        isConnected = false;",
+    "      ws.onclose = () => {\n        wsConnecting = false;\n        isConnected = false;"
+  );
+
+  // V24: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;\n      if (wsConnecting) return;\n      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;\n      wsConnecting = true;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V17: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            }\n          }");
-  // V17: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  html = html.replace('    connect();', '    // V24: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n              if (msg.audioUrl) { opusAudioUrl = msg.audioUrl; if (audioUnlocked && !audioMuted) startOpusAudio(); }\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
+  // V24: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V17: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V24: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V17: không reconnect ở đây để tránh tạo 2 WebSocket và phát audio chồng tiếng. Server sẽ bind socket hiện tại vào session mới."
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V24: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
   );
 
-  // V17: Cho phép gõ bình thường trong ô login/register/upload.
+  // V24: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -885,24 +1324,36 @@ function getPatchedIndexHtml() {
 // =================== WEB SERVER ===================
 function startWebServer() {
   const app = express();
+  if (helmet) app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+  if (cors && CONFIG.corsOrigin) app.use(cors({ origin: CONFIG.corsOrigin === '*' ? true : CONFIG.corsOrigin, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api/', rateLimitMiddleware('api', CONFIG.apiRateLimit));
   ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir);
 
   app.get('/api/me', (req, res) => res.json({ user: db.publicUser(requireUser(req, null)) }));
-  app.post('/api/register', (req, res) => { try { const u = db.register(req.body.username, req.body.password); res.json({ success: true, user: db.publicUser(u) }); } catch (e) { res.status(400).json({ error: e.message }); } });
-  app.post('/api/login', (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user) }); } catch (e) { res.status(401).json({ error: e.message }); } });
+  app.post('/api/register', rateLimitMiddleware('auth-register', CONFIG.authRateLimit), (req, res) => { try { const u = db.register(req.body.username, req.body.password, getIp(req)); res.json({ success: true, user: db.publicUser(u) }); } catch (e) { res.status(400).json({ error: e.message }); } });
+  app.post('/api/login', rateLimitMiddleware('auth-login', CONFIG.authRateLimit), (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); if (CONFIG.sessionPolicy === 'single') { closeUserSockets(user.id, 'logged_in_elsewhere'); stopOtherSessionsForUser(user.id); } setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user), sessionPolicy: CONFIG.sessionPolicy }); } catch (e) { res.status(401).json({ error: e.message }); } });
   app.post('/api/logout', (req, res) => { db.logout(parseCookies(req).fj2me_sid); clearCookie(res, 'fj2me_sid'); res.json({ success: true }); });
+  app.get('/api/queue', (req, res) => res.json({ success: true, queue: startQueue.status(), activeSessions: emulatorSessions.size, limits: { maxActiveSessions: CONFIG.maxActiveSessions, maxWsPerIp: CONFIG.maxWsPerIp, maxClientsPerInstance: CONFIG.maxClientsPerInstance } }));
+  app.get('/api/storage', (req, res) => {
+    const user = requireUser(req, res); if (!user) return;
+    const userBytes = getUserStorageBytes(user.id);
+    res.json({ success: true, userBytes, userMb: +(userBytes/1024/1024).toFixed(2), maxUserStorageMb: CONFIG.maxUserStorageMb, uploadsBytes: dirSizeBytes(CONFIG.uploadsDir), totalDataBytes: dirSizeBytes(CONFIG.dataDir) });
+  });
+  app.post('/api/admin/cleanup', (req, res) => { const user = requireUser(req, res); if (!user) return; runStorageCleanup(); res.json({ success: true }); });
 
   const storage = multer.diskStorage({ destination: (req, file, cb) => cb(null, CONFIG.uploadsDir), filename: (req, file, cb) => cb(null, `game_${Date.now()}_${Math.random().toString(36).slice(2)}${path.extname(file.originalname) || '.jar'}`) });
-  const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
-  app.post('/upload', upload.single('jar'), async (req, res) => {
+  const upload = multer({ storage, limits: { fileSize: CONFIG.maxUploadMb * 1024 * 1024 } });
+  app.post('/upload', rateLimitMiddleware('upload', CONFIG.uploadRateLimit), upload.single('jar'), async (req, res) => {
     const user = requireUser(req, res); if (!user) return;
     if (!req.file) return res.status(400).json({ error: 'Không có file' });
     try {
+      enforceUserStorageQuota(user.id);
+      enforceTotalStorageQuota();
       const jarPath = path.resolve(req.file.path);
       const gameHash = sha1File(jarPath);
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V17: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
+      // V24: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
       // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
       stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
       const sess = getOrCreateSession(user, gameHash, jarPath);
@@ -914,7 +1365,7 @@ function startWebServer() {
       }
       sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
       await sess.start();
-      // V17: bind các WebSocket đang mở của user này vào session mới.
+      // V24: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -922,7 +1373,16 @@ function startWebServer() {
         });
       }
       res.json({ success: true, gameHash, jar: req.file.filename, user: db.publicUser(user), dataDir: sess.dataDir });
-    } catch (e) { console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
+    } catch (e) { if (req.file && req.file.path) removePathSafe(req.file.path); console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
+  });
+
+  app.get('/audio/:id.webm', (req, res) => {
+    const sess = publicSessionIds.get(req.params.id);
+    if (!sess || !sess.isRunning || !sess.opusAudioEnabled) {
+      res.status(404).end('audio stream not found');
+      return;
+    }
+    sess.addAudioHttpClient(res);
   });
 
   app.get(['/', '/index.html'], (req, res) => { try { res.type('html').send(getPatchedIndexHtml()); } catch (e) { console.error('[Web]', e); res.sendFile(path.join(__dirname, 'public', 'index.html')); } });
@@ -930,7 +1390,7 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
+  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
@@ -940,12 +1400,13 @@ function startWebServer() {
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
     ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
-    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality })); }
+    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality })); }
     else sess.addClient(ws);
     ws.on('message', msg => {
       try {
         const s = ws._emuSession || getActiveSessionForUser(user.id); if (!s) return; s.touch();
         const data = JSON.parse(msg.toString());
+        if (data.type === 'key' || data.type === 'touch') s.markInputActivity();
         if (data.type === 'key') { if (data.state === 'D') s.sendKeyDown(data.key); else if (data.state === 'U') s.sendKeyUp(data.key); }
         else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) { const scale = Math.max(1, CONFIG.streamScale | 0); const x = data.x < 0 ? data.x : Math.max(0, Math.min(s.emuFrameWidth - 1, Math.floor(data.x * scale))); const y = data.y < 0 ? data.y : Math.max(0, Math.min(s.emuFrameHeight - 1, Math.floor(data.y * scale))); s.sendMouse(cmd, x, y); } }
       } catch (e) { console.error('[WS]', e.message); }
@@ -956,5 +1417,5 @@ function startWebServer() {
 }
 
 // =================== MAIN ===================
-async function main() { ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir); validateRuntimePaths(); startWebServer(); }
+async function main() { ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir); validateRuntimePaths(); runStorageCleanup(); setInterval(runStorageCleanup, CONFIG.cleanupIntervalMs); startWebServer(); }
 main().catch(err => { console.error('Lỗi nghiêm trọng:', err); process.exit(1); });
