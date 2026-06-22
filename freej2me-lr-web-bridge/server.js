@@ -509,7 +509,7 @@ function getPatchedIndexHtml() {
     <button id="btn-register" style="padding:7px 10px;border:0;border-radius:5px;background:#333;color:#fff">Register</button>
     <button id="btn-logout" style="padding:7px 10px;border:0;border-radius:5px;background:#5c0d0d;color:#fff;display:none">Logout</button>
   </div>`;
-  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer">🔇 Bật âm thanh</button>');
+  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer">🔇 Bật âm thanh</button>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>');
 
   const patchedKeyMap = `const keyMap = {
       'w': 0, 'W': 0, 's': 1, 'S': 1, 'a': 2, 'A': 2, 'd': 3, 'D': 3,
@@ -533,12 +533,21 @@ function getPatchedIndexHtml() {
     const btnRegister = document.getElementById('btn-register');
     const btnLogout = document.getElementById('btn-logout');
     const audioToggle = document.getElementById('audio-toggle');
+    const controlsEl = document.getElementById('controls');
+    const v11ControlsGuard = document.getElementById('v11-controls-guard');
+    let gameLoaded = false;
+    function setGameUiVisible(show) {
+      gameLoaded = !!show;
+      if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
+      if (controlsEl) controlsEl.style.display = show ? 'grid' : 'none';
+    }
+    setGameUiVisible(false);
     let currentUser = null;
     async function api(path, body) { const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined }); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error || r.statusText); return j; }
     async function refreshMe() { try { const j = await api('/api/me'); currentUser = j.user; } catch(e) { currentUser = null; } meLabel.textContent = currentUser ? ('Đăng nhập: ' + currentUser.username) : 'Chưa đăng nhập'; btnLogout.style.display = currentUser ? '' : 'none'; }
-    btnLogin.onclick = async () => { try { await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
-    btnRegister.onclick = async () => { try { await api('/api/register', { username: loginUser.value, password: loginPass.value }); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
-    btnLogout.onclick = async () => { await api('/api/logout', {}); await refreshMe(); if(ws) ws.close(); };
+    btnLogin.onclick = async () => { try { setGameUiVisible(false); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
+    btnRegister.onclick = async () => { try { setGameUiVisible(false); await api('/api/register', { username: loginUser.value, password: loginPass.value }); await api('/api/login', { username: loginUser.value, password: loginPass.value }); await refreshMe(); if(ws) ws.close(); } catch(e) { alert(e.message); } };
+    btnLogout.onclick = async () => { setGameUiVisible(false); await api('/api/logout', {}); await refreshMe(); if(ws) ws.close(); };
     refreshMe();
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
@@ -565,7 +574,17 @@ function getPatchedIndexHtml() {
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            // server auth ok\n          }");
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setGameUiVisible(true);\n            }\n          }");
+  // V11: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  html = html.replace(
+    "uploadStatus.textContent = 'Đang upload...';",
+    "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
+  );
+  // V11: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  html = html.replace(
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          try { if (ws) ws.close(); } catch (e) {}\n          setTimeout(connect, 250);"
+  );
   return html;
 }
 
@@ -591,6 +610,13 @@ function startWebServer() {
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
       const sess = getOrCreateSession(user, gameHash, jarPath);
       await sess.start();
+      // V11: bind các WebSocket đang mở của user này vào session mới.
+      // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
+      if (wss) {
+        wss.clients.forEach((ws) => {
+          if (ws.readyState === WebSocket.OPEN && ws._userId === user.id && ws._emuSession !== sess) sess.addClient(ws);
+        });
+      }
       res.json({ success: true, gameHash, jar: req.file.filename, user: db.publicUser(user), dataDir: sess.dataDir });
     } catch (e) { console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
   });
@@ -608,6 +634,7 @@ function startWebServer() {
   wss.on('connection', (ws, req) => {
     const user = db.getUserBySession(parseCookies(req).fj2me_sid);
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
+    ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
     if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale })); }
     else sess.addClient(ws);
