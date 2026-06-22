@@ -20,6 +20,8 @@ const express = require('express');
 const multer = require('multer');
 const http = require('http');
 const WebSocket = require('ws');
+let sharp = null;
+try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
 
 // =================== CONFIG ===================
 function loadConfig() {
@@ -151,15 +153,21 @@ function loadConfig() {
     // Or set VIDEO_CODEC=rgba|rgb565|rgb332 explicitly.
     imageQuality: Math.max(1, Math.min(100, intConfig('IMAGE_QUALITY', fileConfig.imageQuality, 65))),
     videoCodec: String(process.env.VIDEO_CODEC || fileConfig.videoCodec || '').toLowerCase(),
+    webpQuality: Math.max(1, Math.min(100, intConfig('WEBP_QUALITY', fileConfig.webpQuality, 55))),
+    webpEffort: Math.max(0, Math.min(6, intConfig('WEBP_EFFORT', fileConfig.webpEffort, 0))),
     maxWsBufferedAmount: intConfig('MAX_WS_BUFFERED', fileConfig.maxWsBufferedAmount, 512 * 1024),
     wsCompression: boolConfig('WS_COMPRESSION', fileConfig.wsCompression, false),
     audioPipe: boolConfig('AUDIO_PIPE', fileConfig.audioPipe, true),
 
     frameResyncLog: boolConfig('FRAME_RESYNC_LOG', fileConfig.frameResyncLog, false),
     audioDebugLog: boolConfig('AUDIO_DEBUG_LOG', fileConfig.audioDebugLog, false),
-    // V19: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
+    // V21: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
     audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, 40))),
     audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, 180))),
+    // V21: optional Opus/WebM HTTP audio stream. Requires ffmpeg.
+    audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || 'opus').toLowerCase(),
+    opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || '64k'),
+    ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
 
     maxActiveSessions: intConfig('MAX_ACTIVE_SESSIONS', fileConfig.maxActiveSessions, 8),
     sessionIdleMs: intConfig('SESSION_IDLE_MS', fileConfig.sessionIdleMs, 10 * 60 * 1000),
@@ -171,12 +179,21 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
-if (!['rgba', 'rgb565', 'rgb332'].includes(CONFIG.videoCodec)) {
+if (!['rgba', 'rgb565', 'rgb332', 'webp'].includes(CONFIG.videoCodec)) {
   CONFIG.videoCodec = CONFIG.imageQuality >= 90 ? 'rgba' : (CONFIG.imageQuality >= 45 ? 'rgb565' : 'rgb332');
+}
+if (CONFIG.videoCodec === 'webp' && !sharp) {
+  console.warn('[Video] VIDEO_CODEC=webp nhưng sharp chưa cài được. Fallback rgb565. Chạy: npm install sharp');
+  CONFIG.videoCodec = 'rgb565';
+}
+if (!CONFIG.ffmpegPath || CONFIG.ffmpegPath === 'ffmpeg') {
+  const localFfmpeg = path.join(__dirname, 'tools', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+  if (fs.existsSync(localFfmpeg)) CONFIG.ffmpegPath = localFfmpeg;
 }
 const AUDIO_MAGIC = Buffer.from('FJ2A');
 let wss = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
+const publicSessionIds = new Map(); // publicId -> EmulatorSession for /audio/:id.webm
 
 // =================== UTILS ===================
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
@@ -346,12 +363,18 @@ class EmulatorSession {
   constructor({ user, gameHash, jarPath }) {
     this.user = user; this.userId = user.id; this.username = user.username; this.gameHash = gameHash; this.jarPath = jarPath;
     this.key = `${this.userId}:${gameHash}`;
+    this.publicId = randomId('s_');
+    publicSessionIds.set(this.publicId, this);
     this.clients = new Set();
+    this.audioHttpClients = new Set();
+    this.ffmpeg = null;
+    this.ffmpegReady = false;
+    this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
     this.process = null; this.stdoutReader = null; this.stdin = null;
     this.isRunning = false; this.frameLoopActive = false;
     this.emuFrameWidth = CONFIG.width; this.emuFrameHeight = CONFIG.height;
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
-    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
+    this.stopOpusEncoder(); this.opusAudioEnabled = CONFIG.audioCodec === 'opus'; this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
     this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
     this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 };
     this.audioPcmChunks = [];
@@ -374,7 +397,7 @@ class EmulatorSession {
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
   getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...extra }; }
   getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) { return { width: Math.max(1, Math.floor(width / CONFIG.streamScale)), height: Math.max(1, Math.floor(height / CONFIG.streamScale)) }; }
-  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }); }
+  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }); }
 
   addClient(ws) {
     this.touch();
@@ -382,9 +405,9 @@ class EmulatorSession {
     this.clients.add(ws);
     ws._emuSession = this;
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
-    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash }));
+    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null, audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm' }));
     ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => { this.clients.delete(ws); this.touch(); });
   }
@@ -395,11 +418,29 @@ class EmulatorSession {
     return n;
   }
 
-  convertRgb24ToVideoBuffer(rgb24, width, height) {
+  async convertRgb24ToVideoBuffer(rgb24, width, height) {
     const scale = Math.max(1, CONFIG.streamScale | 0);
     const outWidth = scale <= 1 ? width : Math.max(1, Math.floor(width / scale));
     const outHeight = scale <= 1 ? height : Math.max(1, Math.floor(height / scale));
     const codec = CONFIG.videoCodec;
+
+    // Optional WebP via sharp. Excellent for bandwidth, costs CPU/latency.
+    if (codec === 'webp' && sharp) {
+      const raw = Buffer.allocUnsafe(outWidth * outHeight * 3);
+      let dst = 0;
+      for (let y = 0; y < outHeight; y++) {
+        const srcRow = (y * scale * width) * 3;
+        for (let x = 0; x < outWidth; x++) {
+          const src = srcRow + (x * scale * 3);
+          raw[dst++] = rgb24[src];
+          raw[dst++] = rgb24[src + 1];
+          raw[dst++] = rgb24[src + 2];
+        }
+      }
+      return await sharp(raw, { raw: { width: outWidth, height: outHeight, channels: 3 } })
+        .webp({ quality: CONFIG.webpQuality, effort: CONFIG.webpEffort, smartSubsample: false })
+        .toBuffer();
+    }
 
     if (codec === 'rgb332') {
       const out = Buffer.allocUnsafe(outWidth * outHeight);
@@ -431,7 +472,6 @@ class EmulatorSession {
       return out;
     }
 
-    // rgba 32-bit fallback / best quality.
     const out = Buffer.allocUnsafe(outWidth * outHeight * 4);
     let dst = 0;
     for (let y = 0; y < outHeight; y++) {
@@ -466,6 +506,96 @@ class EmulatorSession {
       if (idx !== -1) this.stdoutReader.prepend(rest.slice(idx));
     }
     throw new Error('Frame loop stopped');
+  }
+
+  startOpusEncoder() {
+    if (!this.opusAudioEnabled || !this.currentAudioFormat || this.ffmpeg) return;
+    const f = this.currentAudioFormat;
+    if (f.bits !== 16 || !f.signed) {
+      console.warn(`[AUDIO ${this.username}] Opus fallback: unsupported PCM format`, f);
+      this.opusAudioEnabled = false;
+      return;
+    }
+    const inputFmt = f.bigEndian ? 's16be' : 's16le';
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', inputFmt,
+      '-ar', String(f.sampleRate || 44100),
+      '-ac', String(f.channels || 2),
+      '-i', 'pipe:0',
+      '-vn',
+      '-c:a', 'libopus',
+      '-b:a', CONFIG.opusBitrate,
+      '-application', 'audio',
+      '-frame_duration', '20',
+      '-vbr', 'on',
+      '-compression_level', '10',
+      '-f', 'webm',
+      '-cluster_time_limit', '100',
+      '-flush_packets', '1',
+      'pipe:1',
+    ];
+    console.log(`[AUDIO ${this.username}] starting ffmpeg opus ${CONFIG.opusBitrate}: ${CONFIG.ffmpegPath} ${args.join(' ')}`);
+    try {
+      this.ffmpeg = spawn(CONFIG.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      this.ffmpegReady = true;
+      this.ffmpeg.stdout.on('data', (chunk) => {
+        for (const res of Array.from(this.audioHttpClients)) {
+          try { res.write(chunk); } catch (e) { this.audioHttpClients.delete(res); }
+        }
+      });
+      this.ffmpeg.stderr.on('data', (d) => {
+        const t = d.toString().trim();
+        if (t) console.warn(`[FFMPEG ${this.username}]`, t);
+      });
+      this.ffmpeg.on('exit', (code) => {
+        console.warn(`[AUDIO ${this.username}] ffmpeg exited code=${code}`);
+        this.ffmpeg = null; this.ffmpegReady = false;
+      });
+      this.ffmpeg.on('error', (err) => {
+        console.warn(`[AUDIO ${this.username}] ffmpeg error: ${err.message}; fallback PCM websocket`);
+        this.opusAudioEnabled = false; this.ffmpeg = null; this.ffmpegReady = false;
+      });
+    } catch (e) {
+      console.warn(`[AUDIO ${this.username}] cannot start ffmpeg: ${e.message}; fallback PCM websocket`);
+      this.opusAudioEnabled = false; this.ffmpeg = null; this.ffmpegReady = false;
+    }
+  }
+
+  writeOpusPcm(payload) {
+    if (!this.opusAudioEnabled) return false;
+    this.startOpusEncoder();
+    if (!this.ffmpeg || !this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed) return false;
+    try { this.ffmpeg.stdin.write(payload); return true; }
+    catch (e) { console.warn(`[AUDIO ${this.username}] ffmpeg stdin write failed:`, e.message); return false; }
+  }
+
+  addAudioHttpClient(res) {
+    if (!this.opusAudioEnabled) return false;
+    res.writeHead(200, {
+      'Content-Type': 'audio/webm; codecs=opus',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    this.audioHttpClients.add(res);
+    res.on('close', () => this.audioHttpClients.delete(res));
+    res.on('error', () => this.audioHttpClients.delete(res));
+    return true;
+  }
+
+  stopOpusEncoder() {
+    for (const res of Array.from(this.audioHttpClients)) {
+      try { res.end(); } catch (e) {}
+    }
+    this.audioHttpClients.clear();
+    if (this.ffmpeg) {
+      try { this.ffmpeg.stdin.end(); } catch (e) {}
+      try { this.ffmpeg.kill('SIGTERM'); } catch (e) {}
+    }
+    this.ffmpeg = null; this.ffmpegReady = false;
   }
 
   makeAudioPcmPacket(payload) {
@@ -528,9 +658,12 @@ class EmulatorSession {
           this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
           this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
           this.flushAudioPcm();
+          this.stopOpusEncoder();
+          this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
           console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
-          this.broadcast(packet, { binary: true, compress: false });
-          this.broadcastJson(this.getAudioStatus({ event: 'format' }));
+          if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
+          this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
+          if (this.opusAudioEnabled) this.startOpusEncoder();
           this.audioPipeBuffer = this.audioPipeBuffer.slice(13); continue;
         }
         if (type === 2) {
@@ -540,8 +673,8 @@ class EmulatorSession {
           const total = 9 + len; if (this.audioPipeBuffer.length < total) return;
           const payload = Buffer.from(this.audioPipeBuffer.slice(9, total));
           this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, coalesce=${CONFIG.audioPacketMs}ms`);
-          this.queueAudioPcm(payload);
+          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${CONFIG.audioPacketMs}ms`);
+          if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
           this.audioPipeBuffer = this.audioPipeBuffer.slice(total); continue;
         }
         this.audioPipeBuffer = this.audioPipeBuffer.slice(1);
@@ -552,6 +685,7 @@ class EmulatorSession {
   cleanupProcess() {
     this.frameLoopActive = false; this.isRunning = false;
     this.flushAudioPcm();
+    this.stopOpusEncoder();
     if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     if (this.process && !this.process.killed) { try { this.process.kill('SIGTERM'); } catch (e) {} }
     this.process = null; this.stdoutReader = null; this.stdin = null;
@@ -615,7 +749,7 @@ class EmulatorSession {
           lastFrameTime = now();
         }
         if (this.countReadyClients() <= 0) { dropBackpressure++; this.sendFrameRequest(); continue; }
-        const videoBuf = this.convertRgb24ToVideoBuffer(rgb24, width, height);
+        const videoBuf = await this.convertRgb24ToVideoBuffer(rgb24, width, height);
         for (const ws of this.clients) {
           if (ws.readyState === WebSocket.OPEN) {
             if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
@@ -840,16 +974,19 @@ function getPatchedIndexHtml() {
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
+    let opusAudioUrl = null;
+    let opusAudioEl = null;
     let videoCodec = 'rgba';
     let imageQuality = 100;
     const AUDIO_START_BUFFER_SEC = 0.18; // overwritten by server config not needed; stable default for tunnel jitter
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
     function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'playback'}); return audioCtx; }
     function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.16); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.18);}catch(e){} }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+AUDIO_START_BUFFER_SEC; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted){ audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; browserTestBeep(); } } };
+    function startOpusAudio(){ if(!opusAudioUrl) return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+AUDIO_START_BUFFER_SEC; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); startOpusAudio(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted){ audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; browserTestBeep(); startOpusAudio(); } } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)+' jitter buffer'); }
+    function handleAudioStatus(msg){ if(msg.audioUrl){ opusAudioUrl = msg.audioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'codec='+(msg.audioCodec||'pcm')+' fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function handleAudioPacket(u8){
       if(!isAudioPacket(u8)) return false;
       const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
@@ -872,16 +1009,22 @@ function getPatchedIndexHtml() {
 
     // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
     let latestFrame = null, rafPending = false, reusableImageData = null;
+    async function drawWebpFrame(src) {
+      const blob = new Blob([src], { type: 'image/webp' });
+      const bitmap = await createImageBitmap(blob);
+      ctx.drawImage(bitmap, 0, 0, screenWidth, screenHeight);
+      bitmap.close && bitmap.close();
+      return true;
+    }
     function decodeVideoFrameToImageData(src, imageData) {
       const dst = imageData.data;
       const pixels = screenWidth * screenHeight;
-      // V15.1 safety: tự nhận codec theo kích thước packet để tránh đen màn hình
-      // nếu config packet tới muộn hoặc client còn cache codec cũ.
       let codec = videoCodec;
-      if (src.length >= pixels * 4) codec = 'rgba';
-      else if (src.length >= pixels * 2) codec = 'rgb565';
-      else if (src.length >= pixels) codec = 'rgb332';
-
+      if (codec !== 'webp') {
+        if (src.length >= pixels * 4) codec = 'rgba';
+        else if (src.length >= pixels * 2) codec = 'rgb565';
+        else if (src.length >= pixels) codec = 'rgb332';
+      }
       if (codec === 'rgb332') {
         if (src.length < pixels) return false;
         for (let i = 0, j = 0; i < pixels; i++, j += 4) {
@@ -909,17 +1052,17 @@ function getPatchedIndexHtml() {
       dst.set(src.subarray(0, expectedSize));
       return true;
     }
-    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(()=>{ rafPending=false; if(!latestFrame) return; if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); if(!decodeVideoFrameToImageData(latestFrame, reusableImageData)) return; ctx.putImageData(reusableImageData,0,0); frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS ['+videoCodec+' q'+imageQuality+']'; frameCount=0; lastFpsTime=n; } }); }
+    function scheduleDraw(){ if(rafPending) return; rafPending=true; requestAnimationFrame(async()=>{ rafPending=false; if(!latestFrame) return; try { if(videoCodec === 'webp') { await drawWebpFrame(latestFrame); } else { if(!reusableImageData || reusableImageData.width!==screenWidth || reusableImageData.height!==screenHeight) reusableImageData=ctx.createImageData(screenWidth, screenHeight); if(!decodeVideoFrameToImageData(latestFrame, reusableImageData)) return; ctx.putImageData(reusableImageData,0,0); } frameCount++; const n=performance.now(); if(n-lastFpsTime>=1000){ fpsEl.textContent=frameCount+' FPS ['+videoCodec+' q'+imageQuality+']'; frameCount=0; lastFpsTime=n; } } catch(e) { console.warn('draw frame failed', e); } }); }
   `;
   html = html.replace("    const jarInput = document.getElementById('jar-input');", "    const jarInput = document.getElementById('jar-input');\n" + injected);
   html = html.replace('          drawFrame(new Uint8Array(event.data));', '          const u8 = new Uint8Array(event.data);\n          if (!handleAudioPacket(u8)) { latestFrame = u8; scheduleDraw(); }');
-  // V19: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
+  // V21: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
     "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
   );
 
-  // V19: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
+  // V21: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
   html = html.replace(
     "      ws.onopen = () => {\n        isConnected = true;",
     "      ws.onopen = () => {\n        wsConnecting = false;\n        isConnected = true;"
@@ -929,23 +1072,23 @@ function getPatchedIndexHtml() {
     "      ws.onclose = () => {\n        wsConnecting = false;\n        isConnected = false;"
   );
 
-  // V19: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
+  // V21: không tự WebSocket reconnect khi chưa đăng nhập, để form login/register gõ bình thường.
   html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;\n      if (wsConnecting) return;\n      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;\n      wsConnecting = true;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
-  html = html.replace('    connect();', '    // V19: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
-  // V19: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
+  html = html.replace('    connect();', '    // V21: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n              if (msg.audioUrl) { opusAudioUrl = msg.audioUrl; if (audioUnlocked && !audioMuted) startOpusAudio(); }\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
+  // V21: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
     "uploadStatus.textContent = 'Đang upload...';\n      setGameUiVisible(false);"
   );
-  // V19: sau upload thành công, reconnect WS để bind vào emulator session mới.
+  // V21: sau upload thành công, reconnect WS để bind vào emulator session mới.
   html = html.replace(
     "uploadStatus.textContent = `Đang chạy: ${file.name}`;",
-    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V19: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
+    "uploadStatus.textContent = `Đang chạy: ${file.name}`;\n          // V21: reconnect an toàn 1 lần để chắc chắn socket bind vào session mới.\n          reconnectWsSoon(250);"
   );
 
-  // V19: Cho phép gõ bình thường trong ô login/register/upload.
+  // V21: Cho phép gõ bình thường trong ô login/register/upload.
   // index.html gốc bắt keydown toàn window và preventDefault với các phím W/A/S/D/Q/E/Z/C/0-9,
   // làm input username/password không gõ được. Chặn input focus trước khi keyMap xử lý.
   const inputGuard = `
@@ -988,7 +1131,7 @@ function startWebServer() {
       const jarPath = path.resolve(req.file.path);
       const gameHash = sha1File(jarPath);
       if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V19: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
+      // V21: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
       // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
       stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
       const sess = getOrCreateSession(user, gameHash, jarPath);
@@ -1000,7 +1143,7 @@ function startWebServer() {
       }
       sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
       await sess.start();
-      // V19: bind các WebSocket đang mở của user này vào session mới.
+      // V21: bind các WebSocket đang mở của user này vào session mới.
       // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
       if (wss) {
         wss.clients.forEach((ws) => {
@@ -1011,12 +1154,21 @@ function startWebServer() {
     } catch (e) { console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
   });
 
+  app.get('/audio/:id.webm', (req, res) => {
+    const sess = publicSessionIds.get(req.params.id);
+    if (!sess || !sess.isRunning || !sess.opusAudioEnabled) {
+      res.status(404).end('audio stream not found');
+      return;
+    }
+    sess.addAudioHttpClient(res);
+  });
+
   app.get(['/', '/index.html'], (req, res) => { try { res.type('html').send(getPatchedIndexHtml()); } catch (e) { console.error('[Web]', e); res.sendFile(path.join(__dirname, 'public', 'index.html')); } });
   app.use(express.static(path.join(__dirname, 'public')));
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
+  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
@@ -1026,7 +1178,7 @@ function startWebServer() {
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
     ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
-    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality })); }
+    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality })); }
     else sess.addClient(ws);
     ws.on('message', msg => {
       try {
