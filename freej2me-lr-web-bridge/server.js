@@ -266,6 +266,10 @@ function loadConfig() {
     audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || profile.audioCodec).toLowerCase(),
     opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || profile.opusBitrate),
     ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
+    adaptiveStreaming: boolConfig('ADAPTIVE_STREAMING', fileConfig.adaptiveStreaming, true),
+    adaptiveLevels: Math.max(12, Math.min(100, intConfig('ADAPTIVE_LEVELS', fileConfig.adaptiveLevels, 20))),
+    adaptiveWindowMs: Math.max(400, Math.min(5000, intConfig('ADAPTIVE_WINDOW_MS', fileConfig.adaptiveWindowMs, 1000))),
+    adaptiveRecoverWindows: Math.max(2, Math.min(10, intConfig('ADAPTIVE_RECOVER_WINDOWS', fileConfig.adaptiveRecoverWindows, 3))),
     javaBackendHost: process.env.JAVA_BACKEND_HOST || fileConfig.javaBackendHost || '127.0.0.1',
     javaBackendPort: intConfig('JAVA_BACKEND_PORT', fileConfig.javaBackendPort, 35555),
     javaBackendRestartDelayMs: intConfig('JAVA_BACKEND_RESTART_DELAY_MS', fileConfig.javaBackendRestartDelayMs, 1500),
@@ -306,6 +310,9 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
+function clampNumber(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function roundStep(v, step) { return Math.round(v / step) * step; }
 if (CONFIG.clientAudioMaxBufferMs < CONFIG.clientAudioMinBufferMs) CONFIG.clientAudioMaxBufferMs = CONFIG.clientAudioMinBufferMs;
 if (!['rgba', 'rgb565', 'rgb332', 'webp'].includes(CONFIG.videoCodec)) {
   CONFIG.videoCodec = CONFIG.imageQuality >= 90 ? 'rgba' : (CONFIG.imageQuality >= 45 ? 'rgb565' : 'rgb332');
@@ -318,6 +325,62 @@ if (!CONFIG.ffmpegPath || CONFIG.ffmpegPath === 'ffmpeg') {
   const localFfmpeg = path.join(__dirname, 'tools', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
   if (fs.existsSync(localFfmpeg)) CONFIG.ffmpegPath = localFfmpeg;
 }
+function probeFfmpegAvailability() {
+  if (!CONFIG.ffmpegPath) return { available: false, reason: 'no-path' };
+  try {
+    const r = spawnSync(CONFIG.ffmpegPath, ['-version'], { encoding: 'utf8', windowsHide: true });
+    if (r.error) return { available: false, reason: r.error.message || 'spawn-error' };
+    if (r.status !== 0) return { available: false, reason: `exit-${r.status}` };
+    return { available: true, reason: 'ok' };
+  } catch (e) {
+    return { available: false, reason: e.message || 'exception' };
+  }
+}
+function buildAdaptiveProfiles() {
+  const count = CONFIG.adaptiveLevels;
+  const profiles = [];
+  for (let i = 0; i < count; i++) {
+    const t = count <= 1 ? 0 : (i / (count - 1));
+    let videoCodec;
+    if (t < 0.28) videoCodec = 'rgba';
+    else if (t < 0.58) videoCodec = 'rgb565';
+    else if (t < 0.82) videoCodec = 'rgb332';
+    else videoCodec = 'webp';
+    if (videoCodec === 'webp' && !sharp) videoCodec = 'rgb332';
+    const streamScale = t < 0.72 ? 1 : (t < 0.92 ? 2 : 3);
+    const maxFps = clampNumber(Math.round(lerp(Math.max(24, CONFIG.maxFps), 8, t)), 8, 60);
+    const imageQuality = clampNumber(Math.round(lerp(100, 18, t)), 1, 100);
+    const webpQuality = clampNumber(Math.round(lerp(86, 28, t)), 1, 100);
+    const audioCodec = (FFMPEG_PROBE.available && t >= 0.34) ? 'opus' : 'pcm';
+    const opusKbps = clampNumber(Math.round(lerp(96, 24, t) / 4) * 4, 24, 128);
+    const audioPacketMs = clampNumber(Math.round(lerp(24, 90, t) / 2) * 2, 10, 120);
+    const audioStartBufferMs = clampNumber(Math.round(lerp(70, 260, t)), 40, 500);
+    const clientAudioMinBufferMs = clampNumber(Math.round(lerp(50, 180, t)), 40, 500);
+    const clientAudioMaxBufferMs = clampNumber(Math.round(lerp(140, 520, t)), clientAudioMinBufferMs, 1000);
+    const maxWsBufferedAmount = clampNumber(Math.round(lerp(1536 * 1024, 256 * 1024, t)), 128 * 1024, 2 * 1024 * 1024);
+    profiles.push({
+      level: i,
+      label: `L${i + 1}`,
+      severity: t,
+      videoCodec,
+      imageQuality,
+      webpQuality,
+      streamScale,
+      maxFps,
+      audioCodec,
+      opusBitrate: `${opusKbps}k`,
+      audioPacketMs,
+      audioStartBufferMs,
+      clientAudioMinBufferMs,
+      clientAudioMaxBufferMs,
+      maxWsBufferedAmount,
+      wsCompression: false,
+    });
+  }
+  return profiles;
+}
+const FFMPEG_PROBE = probeFfmpegAvailability();
+const ADAPTIVE_PROFILES = buildAdaptiveProfiles();
 const AUDIO_MAGIC = Buffer.from('FJ2A');
 const SERVER_LOCK_PATH = path.join(CONFIG.dataDir, `server-${CONFIG.port}.lock.json`);
 let wss = null;
@@ -841,7 +904,9 @@ class EmulatorSession {
     this.audioHttpClients = new Set();
     this.ffmpeg = null;
     this.ffmpegReady = false;
-    this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
+    this.profileLevel = 0;
+    this.profile = ADAPTIVE_PROFILES[0] || null;
+    this.opusAudioEnabled = !!(this.profile && this.profile.audioCodec === 'opus' && FFMPEG_PROBE.available);
     this.isRunning = false;
     this.backendWs = null;
     this.backendConnected = false;
@@ -854,16 +919,67 @@ class EmulatorSession {
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
     this.currentAudioFormat = null;
     this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
-    this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 };
+    this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0, dropEvents: 0, dropWindows: 0, stableWindows: 0, lastAdaptiveAt: now(), lastAdaptiveBumpAt: 0 };
     this.audioPcmChunks = [];
     this.audioPcmBytes = 0;
     this.audioFlushTimer = null;
     this.lastActivity = now();
     this.dataDir = path.join(CONFIG.dataDir, 'users', safeName(this.userId), 'games', gameHash, 'runtime');
     ensureDir(this.dataDir);
+    this.applyAdaptiveProfile(0, 'init');
   }
 
   touch() { this.lastActivity = now(); }
+  getCurrentProfile() { return this.profile || ADAPTIVE_PROFILES[0]; }
+  applyAdaptiveProfile(level, reason = 'manual') {
+    const max = ADAPTIVE_PROFILES.length - 1;
+    const nextLevel = clampNumber(level, 0, max);
+    const prevProfile = this.profile;
+    this.profileLevel = nextLevel;
+    this.profile = ADAPTIVE_PROFILES[nextLevel] || ADAPTIVE_PROFILES[0];
+    this.opusAudioEnabled = !!(this.profile && this.profile.audioCodec === 'opus' && FFMPEG_PROBE.available);
+    if (!this.opusAudioEnabled) this.stopOpusEncoder();
+    else if (this.currentAudioFormat) this.startOpusEncoder();
+    if (this.isRunning) this.startFramePump();
+    if (!prevProfile || prevProfile.level !== this.profile.level || reason !== 'init') {
+      console.log(`[ADAPT ${this.username}] ${reason} -> level=${this.profile.level + 1}/${ADAPTIVE_PROFILES.length} codec=${this.profile.videoCodec} scale=${this.profile.streamScale} fps=${this.profile.maxFps} audio=${this.profile.audioCodec}${this.opusAudioEnabled ? ':' + this.profile.opusBitrate : ''}`);
+      if (this.clients.size > 0) {
+        this.broadcastConfig();
+        this.broadcastJson(this.getAudioStatus({ event: 'adaptive-profile', adaptiveLevel: this.profile.level, adaptiveCount: ADAPTIVE_PROFILES.length }));
+      }
+    }
+  }
+  noteAdaptiveWindow(hadDrops) {
+    if (!CONFIG.adaptiveStreaming || ADAPTIVE_PROFILES.length <= 1) return;
+    if (hadDrops) {
+      this.videoStats.dropWindows++;
+      this.videoStats.stableWindows = 0;
+      const nowTs = now();
+      if (ADAPTIVE_PROFILES.length >= 50) {
+        if (nowTs - this.videoStats.lastAdaptiveBumpAt >= 120 && this.profileLevel < ADAPTIVE_PROFILES.length - 1) {
+          this.videoStats.lastAdaptiveBumpAt = nowTs;
+          this.applyAdaptiveProfile(this.profileLevel + 1, `drop-hit-${this.videoStats.dropWindows}`);
+        }
+      } else if (this.profileLevel < ADAPTIVE_PROFILES.length - 1) {
+        this.applyAdaptiveProfile(this.profileLevel + 1, `drop-window-${this.videoStats.dropWindows}`);
+      }
+      return;
+    }
+    this.videoStats.stableWindows++;
+    if (this.videoStats.stableWindows >= CONFIG.adaptiveRecoverWindows) {
+      this.videoStats.stableWindows = 0;
+      if (this.profileLevel > 0) this.applyAdaptiveProfile(this.profileLevel - 1, 'recover');
+    }
+  }
+  maybeEvaluateAdaptiveWindow() {
+    if (!CONFIG.adaptiveStreaming) return;
+    const nowTs = now();
+    if (nowTs - this.videoStats.lastAdaptiveAt < CONFIG.adaptiveWindowMs) return;
+    const hadDrops = this.videoStats.dropEvents > 0;
+    this.videoStats.lastAdaptiveAt = nowTs;
+    this.videoStats.dropEvents = 0;
+    this.noteAdaptiveWindow(hadDrops);
+  }
   buildRawCommand(cmd, value) {
     const b = Buffer.alloc(5);
     b[0] = cmd & 0xFF;
@@ -890,22 +1006,29 @@ class EmulatorSession {
   broadcast(data, opts = {}) { for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data, opts); }
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
   getClientAudioTuning() {
+    const p = this.getCurrentProfile();
     return {
       transportProfile: CONFIG.transportProfile,
       audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer,
-      audioPacketMs: CONFIG.audioPacketMs,
-      audioStartBufferMs: CONFIG.audioStartBufferMs,
-      clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs,
-      clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs,
+      audioPacketMs: p.audioPacketMs,
+      audioStartBufferMs: p.audioStartBufferMs,
+      clientAudioMinBufferMs: p.clientAudioMinBufferMs,
+      clientAudioMaxBufferMs: p.clientAudioMaxBufferMs,
       audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm',
+      adaptiveLevel: this.profileLevel,
+      adaptiveCount: ADAPTIVE_PROFILES.length,
     };
   }
-  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...this.getClientAudioTuning(), ...extra }; }
-  getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) { return { width: Math.max(1, Math.floor(width / CONFIG.streamScale)), height: Math.max(1, Math.floor(height / CONFIG.streamScale)) }; }
+  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ffmpegAvailable: FFMPEG_PROBE.available, ...this.audioStats, ...this.getClientAudioTuning(), ...extra }; }
+  getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) {
+    const scale = Math.max(1, (this.getCurrentProfile().streamScale || 1) | 0);
+    return { width: Math.max(1, Math.floor(width / scale)), height: Math.max(1, Math.floor(height / scale)) };
+  }
   broadcastConfig() {
+    const p = this.getCurrentProfile();
     const d = this.getStreamDimensions();
     this.streamOutWidth = d.width; this.streamOutHeight = d.height;
-    this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, ...this.getClientAudioTuning() });
+    this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ffmpegAvailable: FFMPEG_PROBE.available, ...this.getClientAudioTuning() });
   }
 
   cancelNoClientShutdown() {
@@ -953,9 +1076,10 @@ class EmulatorSession {
     this.clients.add(ws);
     ws._emuSession = this;
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
+    const p = this.getCurrentProfile();
     ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null, audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm' }));
     ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, ...this.getClientAudioTuning() }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ffmpegAvailable: FFMPEG_PROBE.available, ...this.getClientAudioTuning() }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => {
       this.clients.delete(ws);
@@ -965,16 +1089,18 @@ class EmulatorSession {
   }
 
   countReadyClients() {
+    const p = this.getCurrentProfile();
     let n = 0;
-    for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) n++;
+    for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= p.maxWsBufferedAmount) n++;
     return n;
   }
 
   async convertRgb24ToVideoBuffer(rgb24, width, height) {
-    const scale = Math.max(1, CONFIG.streamScale | 0);
+    const p = this.getCurrentProfile();
+    const scale = Math.max(1, (p.streamScale || 1) | 0);
     const outWidth = scale <= 1 ? width : Math.max(1, Math.floor(width / scale));
     const outHeight = scale <= 1 ? height : Math.max(1, Math.floor(height / scale));
-    const codec = CONFIG.videoCodec;
+    const codec = p.videoCodec;
 
     if (codec === 'webp' && sharp) {
       const raw = Buffer.allocUnsafe(outWidth * outHeight * 3);
@@ -989,7 +1115,7 @@ class EmulatorSession {
         }
       }
       return await sharp(raw, { raw: { width: outWidth, height: outHeight, channels: 3 } })
-        .webp({ quality: CONFIG.webpQuality, effort: CONFIG.webpEffort, smartSubsample: false })
+        .webp({ quality: p.webpQuality, effort: CONFIG.webpEffort, smartSubsample: false })
         .toBuffer();
     }
 
@@ -1039,7 +1165,8 @@ class EmulatorSession {
   }
 
   startOpusEncoder() {
-    if (!this.opusAudioEnabled || !this.currentAudioFormat || this.ffmpeg) return;
+    const p = this.getCurrentProfile();
+    if (!FFMPEG_PROBE.available || !this.opusAudioEnabled || !this.currentAudioFormat || this.ffmpeg) return;
     const f = this.currentAudioFormat;
     if (f.bits !== 16 || !f.signed) {
       console.warn(`[AUDIO ${this.username}] Opus fallback: unsupported PCM format`, f);
@@ -1055,7 +1182,7 @@ class EmulatorSession {
       '-i', 'pipe:0',
       '-vn',
       '-c:a', 'libopus',
-      '-b:a', CONFIG.opusBitrate,
+      '-b:a', p.opusBitrate,
       '-application', 'audio',
       '-frame_duration', '20',
       '-vbr', 'on',
@@ -1065,7 +1192,7 @@ class EmulatorSession {
       '-flush_packets', '1',
       'pipe:1',
     ];
-    console.log(`[AUDIO ${this.username}] starting ffmpeg opus ${CONFIG.opusBitrate}: ${CONFIG.ffmpegPath} ${args.join(' ')}`);
+    console.log(`[AUDIO ${this.username}] starting ffmpeg opus ${p.opusBitrate}: ${CONFIG.ffmpegPath} ${args.join(' ')}`);
     try {
       this.ffmpeg = spawn(CONFIG.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       this.ffmpegReady = true;
@@ -1153,16 +1280,17 @@ class EmulatorSession {
   }
 
   queueAudioPcm(payload) {
+    const p = this.getCurrentProfile();
     if (!payload || payload.length <= 0) return;
     this.audioPcmChunks.push(Buffer.from(payload));
     this.audioPcmBytes += payload.length;
-    const targetBytes = this.audioBytesPerMs() * CONFIG.audioPacketMs;
+    const targetBytes = this.audioBytesPerMs() * p.audioPacketMs;
     if (this.audioPcmBytes >= targetBytes) {
       this.flushAudioPcm();
       return;
     }
     if (!this.audioFlushTimer) {
-      this.audioFlushTimer = setTimeout(() => this.flushAudioPcm(), CONFIG.audioPacketMs);
+      this.audioFlushTimer = setTimeout(() => this.flushAudioPcm(), p.audioPacketMs);
     }
   }
 
@@ -1208,12 +1336,14 @@ class EmulatorSession {
   }
 
   startFramePump() {
+    const p = this.getCurrentProfile();
     if (this.frameRequestTimer) clearInterval(this.frameRequestTimer);
-    const interval = Math.max(25, Math.floor(1000 / Math.max(1, CONFIG.maxFps || 30)));
+    const interval = Math.max(25, Math.floor(1000 / Math.max(1, p.maxFps || 30)));
     this.frameRequestTimer = setInterval(() => {
       if (!this.backendConnected) return;
       if (this.clients.size === 0) return;
       this.sendFrameRequest();
+      this.maybeEvaluateAdaptiveWindow();
     }, interval);
     this.sendFrameRequest();
   }
@@ -1340,7 +1470,7 @@ class EmulatorSession {
       this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
       this.flushAudioPcm();
       this.stopOpusEncoder();
-      this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
+      this.opusAudioEnabled = !!(this.getCurrentProfile().audioCodec === 'opus' && FFMPEG_PROBE.available);
       console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
       if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
       this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
@@ -1353,13 +1483,14 @@ class EmulatorSession {
       if (len > 1024 * 1024 || 9 + len > packet.length) return;
       const payload = Buffer.from(packet.slice(9, 9 + len));
       this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${CONFIG.audioPacketMs}ms`);
+      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${this.getCurrentProfile().audioPacketMs}ms`);
       if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
     }
   }
 
   async handleBackendFramePacket(packet) {
     if (packet.length < 16) return;
+    const p = this.getCurrentProfile();
     const header = packet.slice(0, 16);
     const width = (header[1] << 8) | header[2];
     const height = (header[3] << 8) | header[4];
@@ -1377,17 +1508,29 @@ class EmulatorSession {
     if (dims.width !== this.streamOutWidth || dims.height !== this.streamOutHeight) this.broadcastConfig();
     this.videoStats.framesRead++;
     this.videoStats.lastFrameAt = now();
-    if (this.countReadyClients() <= 0) return;
+    if (this.clients.size === 0) return;
+    if (this.countReadyClients() <= 0) {
+      this.videoStats.dropEvents++;
+      this.maybeEvaluateAdaptiveWindow();
+      return;
+    }
     const rgb24 = packet.slice(16, 16 + frameSize);
     const videoBuf = await this.convertRgb24ToVideoBuffer(rgb24, width, height);
+    let sentAny = false;
+    let hadDrop = false;
     for (const ws of this.clients) {
       if (ws.readyState === WebSocket.OPEN) {
-        if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) {
-          ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
+        if (ws.bufferedAmount <= p.maxWsBufferedAmount) {
+          ws.send(videoBuf, { binary: true, compress: p.wsCompression });
           this.videoStats.framesSent++;
+          sentAny = true;
+        } else {
+          hadDrop = true;
         }
       }
     }
+    if (!sentAny || hadDrop) this.videoStats.dropEvents++;
+    this.maybeEvaluateAdaptiveWindow();
   }
 
   async destroySession(reason = 'cleanup') {
@@ -1621,6 +1764,9 @@ function getPatchedIndexHtml() {
     let imageQuality = 100;
     let transportProfile = 'local';
     let audioAdaptiveBuffer = true;
+    let adaptiveLevel = 0, adaptiveCount = 1;
+    let audioCodecMode = 'pcm';
+    let ffmpegAvailable = false;
     let audioPacketMs = 40;
     let audioStartBufferSec = 0.11;
     let audioMinBufferSec = 0.07;
@@ -1635,6 +1781,10 @@ function getPatchedIndexHtml() {
       if(!msg) return;
       transportProfile = msg.transportProfile || transportProfile || 'local';
       audioAdaptiveBuffer = msg.audioAdaptiveBuffer !== false;
+      adaptiveLevel = (msg.adaptiveLevel ?? adaptiveLevel) | 0;
+      adaptiveCount = Math.max(1, (msg.adaptiveCount ?? adaptiveCount) | 0);
+      ffmpegAvailable = !!msg.ffmpegAvailable;
+      audioCodecMode = msg.audioCodec || audioCodecMode || 'pcm';
       audioPacketMs = Math.max(10, Math.min(120, msg.audioPacketMs || audioPacketMs || 40));
       audioStartBufferSec = clamp((msg.audioStartBufferMs || (transportProfile === 'remote' ? 180 : 110)) / 1000, 0.04, 0.50);
       audioMinBufferSec = clamp((msg.clientAudioMinBufferMs || (transportProfile === 'remote' ? 120 : 70)) / 1000, 0.04, 0.50);
@@ -1642,17 +1792,18 @@ function getPatchedIndexHtml() {
       audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec);
     }
     function resetAudioScheduler(){ if(audioCtx) audioNextTime = audioCtx.currentTime + audioTargetBufferSec; }
+    function stopOpusAudio(){ if(opusAudioEl){ try{ opusAudioEl.pause(); }catch(e){} try{ opusAudioEl.removeAttribute('src'); opusAudioEl.load(); }catch(e){} } }
     function refreshAudioButtonTitle(extra){
       const state = audioUnlocked && !audioMuted ? '🔊 Âm thanh: bật' : '🔇 Bật âm thanh';
-      const codec = opusAudioUrl ? 'opus' : 'pcm';
-      const title = 'codec=' + codec + ' profile=' + transportProfile + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
+      const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
+      const title = 'codec=' + codec + ' ffmpeg=' + (ffmpegAvailable ? 'on' : 'off') + ' profile=' + transportProfile + ' ladder=' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
       setAudioButton(state, title);
     }
-    function startOpusAudio(){ if(!opusAudioUrl) return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); refreshAudioButtonTitle(); }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); startOpusAudio(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); startOpusAudio(); } refreshAudioButtonTitle(); } };
+    function startOpusAudio(){ if(!opusAudioUrl || audioCodecMode !== 'opus') return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); refreshAudioButtonTitle(); }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); } refreshAudioButtonTitle(); } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ applyAudioTuning(msg); if(msg.audioUrl){ opusAudioUrl = msg.audioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ applyAudioTuning(msg); if(audioCodecMode === 'opus'){ opusAudioUrl = msg.audioUrl || opusAudioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } else { opusAudioUrl = null; stopOpusAudio(); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function handleAudioPacket(u8){
       if(!isAudioPacket(u8)) return false;
       const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
@@ -1859,7 +2010,7 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] mode=single-java profile=${CONFIG.transportProfile}, maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, audioStartBufferMs=${CONFIG.audioStartBufferMs}, clientAudioMinBufferMs=${CONFIG.clientAudioMinBufferMs}, clientAudioMaxBufferMs=${CONFIG.clientAudioMaxBufferMs}, adaptiveAudio=${CONFIG.audioAdaptiveBuffer ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
+  console.log(`[Stream] mode=single-java profile=${CONFIG.transportProfile}, adaptiveStreaming=${CONFIG.adaptiveStreaming ? 'on' : 'off'}, adaptiveLevels=${ADAPTIVE_PROFILES.length}, adaptiveWindowMs=${CONFIG.adaptiveWindowMs}, recoverWindows=${CONFIG.adaptiveRecoverWindows}, startCodec=${ADAPTIVE_PROFILES[0].videoCodec}/${ADAPTIVE_PROFILES[0].audioCodec}, endCodec=${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].videoCodec}/${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].audioCodec}, sharp=${sharp ? 'on' : 'off'}, ffmpeg=${FFMPEG_PROBE.available ? 'on' : 'off:' + FFMPEG_PROBE.reason}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] sharedJar=${CONFIG.freej2meJar}`);
@@ -1871,8 +2022,9 @@ function startWebServer() {
     ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
     if (!sess) {
+      const p = ADAPTIVE_PROFILES[0] || { streamScale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, audioPacketMs: CONFIG.audioPacketMs, audioStartBufferMs: CONFIG.audioStartBufferMs, clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs, clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs, audioCodec: CONFIG.audioCodec };
       ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true }));
-      ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, transportProfile: CONFIG.transportProfile, audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer, audioPacketMs: CONFIG.audioPacketMs, audioStartBufferMs: CONFIG.audioStartBufferMs, clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs, clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs, audioCodec: CONFIG.audioCodec }));
+      ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / p.streamScale), height: Math.floor(CONFIG.height / p.streamScale), scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ffmpegAvailable: FFMPEG_PROBE.available, transportProfile: CONFIG.transportProfile, audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer, adaptiveLevel: 0, adaptiveCount: ADAPTIVE_PROFILES.length, audioPacketMs: p.audioPacketMs, audioStartBufferMs: p.audioStartBufferMs, clientAudioMinBufferMs: p.clientAudioMinBufferMs, clientAudioMaxBufferMs: p.clientAudioMaxBufferMs, audioCodec: p.audioCodec }));
     }
     else sess.addClient(ws);
     ws.on('message', msg => {
@@ -1881,7 +2033,7 @@ function startWebServer() {
         const data = JSON.parse(msg.toString());
         if (data.type === 'key' || data.type === 'touch') s.markInputActivity();
         if (data.type === 'key') { if (data.state === 'D') s.sendKeyDown(data.key); else if (data.state === 'U') s.sendKeyUp(data.key); }
-        else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) { const scale = Math.max(1, CONFIG.streamScale | 0); const x = data.x < 0 ? data.x : Math.max(0, Math.min(s.emuFrameWidth - 1, Math.floor(data.x * scale))); const y = data.y < 0 ? data.y : Math.max(0, Math.min(s.emuFrameHeight - 1, Math.floor(data.y * scale))); s.sendMouse(cmd, x, y); } }
+        else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) { const scale = Math.max(1, ((s.getCurrentProfile ? s.getCurrentProfile().streamScale : CONFIG.streamScale) || 1) | 0); const x = data.x < 0 ? data.x : Math.max(0, Math.min(s.emuFrameWidth - 1, Math.floor(data.x * scale))); const y = data.y < 0 ? data.y : Math.max(0, Math.min(s.emuFrameHeight - 1, Math.floor(data.y * scale))); s.sendMouse(cmd, x, y); } }
       } catch (e) { console.error('[WS]', e.message); }
     });
   });
