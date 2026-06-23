@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const http = require('http');
+const net = require('net');
 const WebSocket = require('ws');
 let sharp = null;
 try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
@@ -43,28 +44,57 @@ function loadConfig() {
     return path.resolve(__dirname, p);
   }
 
+  function isGitLfsPointerFile(filePath) {
+    try {
+      if (!filePath || !fs.existsSync(filePath)) return false;
+      const st = fs.statSync(filePath);
+      if (!st.isFile() || st.size > 1024) return false;
+      const head = fs.readFileSync(filePath, 'utf8').slice(0, 200);
+      return head.includes('git-lfs.github.com/spec');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function pickExistingJar(candidates) {
+    const existing = [];
+    for (const candidate of candidates) {
+      try {
+        if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) existing.push(candidate);
+      } catch (e) {}
+    }
+    if (!existing.length) return null;
+    const actual = existing.find(candidate => !isGitLfsPointerFile(candidate));
+    return actual || existing[0];
+  }
+
   function resolveFreej2meJar(p) {
+    const sharedCandidates = [
+      'freej2me-lr.jar',
+      'freej2me-lr-shared.jar',
+      'freej2me-lr-server.jar',
+    ];
     const audioCandidates = [
       'freej2me-lr-audiopipe-v2-debug.jar',
       'freej2me-lr-audiopipe-v2.jar',
       'freej2me-lr-audiopipe.jar',
       'freej2me-lr-audiopipe-v1.jar',
     ];
+    const allCandidates = [...sharedCandidates, ...audioCandidates];
     const resolved = resolvePath(p);
     if (!resolved) return path.resolve(__dirname, './freej2me-lr.jar');
     try {
       if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-        for (const name of audioCandidates) {
-          const candidate = path.join(resolved, name);
-          if (fs.existsSync(candidate)) return candidate;
-        }
+        const picked = pickExistingJar(allCandidates.map(name => path.join(resolved, name)));
+        if (picked) return picked;
         return path.join(resolved, 'freej2me-lr.jar');
       }
+
       const dir = path.dirname(resolved);
-      for (const name of audioCandidates) {
-        const candidate = path.join(dir, name);
-        if (fs.existsSync(candidate)) return candidate;
-      }
+      const base = path.basename(resolved);
+      const siblingCandidates = [resolved, ...allCandidates.filter(name => name !== base).map(name => path.join(dir, name))];
+      const picked = pickExistingJar(siblingCandidates);
+      if (picked) return picked;
     } catch (e) {}
     return resolved;
   }
@@ -137,11 +167,71 @@ function loadConfig() {
     return findJavaInPath();
   }
 
-  const targetFps = intConfig('TARGET_FPS', fileConfig.targetFps ?? fileConfig.maxFps, 30);
+  function resolveTransportProfile() {
+    const raw = String(process.env.TRANSPORT_PROFILE || fileConfig.transportProfile || 'auto').toLowerCase();
+    if (raw === 'auto') {
+      if (process.env.CODESPACES || process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN || process.env.GITPOD_WORKSPACE_ID || process.env.RENDER || process.env.RAILWAY_ENVIRONMENT) return 'remote';
+      return 'local';
+    }
+    if (raw === 'remote' || raw === 'balanced' || raw === 'local') return raw;
+    return 'local';
+  }
+
+  const transportProfile = resolveTransportProfile();
+  const profileDefaults = {
+    local: {
+      targetFps: 30,
+      maxFps: 30,
+      streamScale: 1,
+      imageQuality: 80,
+      videoCodec: 'rgb565',
+      webpQuality: 55,
+      audioPacketMs: 40,
+      audioStartBufferMs: 110,
+      audioMinBufferMs: 70,
+      audioMaxBufferMs: 260,
+      audioCodec: 'opus',
+      opusBitrate: '96k',
+      wsCompression: false,
+    },
+    balanced: {
+      targetFps: 30,
+      maxFps: 24,
+      streamScale: 1,
+      imageQuality: 65,
+      videoCodec: 'rgb565',
+      webpQuality: 52,
+      audioPacketMs: 50,
+      audioStartBufferMs: 140,
+      audioMinBufferMs: 90,
+      audioMaxBufferMs: 320,
+      audioCodec: 'opus',
+      opusBitrate: '80k',
+      wsCompression: false,
+    },
+    remote: {
+      targetFps: 30,
+      maxFps: 20,
+      streamScale: 1,
+      imageQuality: 55,
+      videoCodec: 'webp',
+      webpQuality: 48,
+      audioPacketMs: 60,
+      audioStartBufferMs: 180,
+      audioMinBufferMs: 120,
+      audioMaxBufferMs: 420,
+      audioCodec: 'opus',
+      opusBitrate: '64k',
+      wsCompression: false,
+    },
+  };
+  const profile = profileDefaults[transportProfile] || profileDefaults.local;
+  const targetFps = intConfig('TARGET_FPS', fileConfig.targetFps ?? fileConfig.maxFps, profile.targetFps);
 
   return {
     javaPath: resolveJavaPath(),
     freej2meJar: process.env.FREEJ2ME_LR_JAR ? resolveFreej2meJar(process.env.FREEJ2ME_LR_JAR) : resolveFreej2meJar(fileConfig.freej2meJar),
+    transportProfile,
     port: intConfig('PORT', fileConfig.port, 3000),
 
     width: intConfig('SCREEN_WIDTH', fileConfig.width, 240),
@@ -151,28 +241,35 @@ function loadConfig() {
     fps: intConfig('FPS', undefined, targetFps),
     sound: intConfig('SOUND', fileConfig.sound, 1),
 
-    maxFps: intConfig('MAX_FPS', fileConfig.maxFps, targetFps),
-    streamScale: Math.max(1, intConfig('STREAM_SCALE', fileConfig.streamScale, 1)),
+    maxFps: intConfig('MAX_FPS', fileConfig.maxFps, profile.maxFps),
+    streamScale: Math.max(1, intConfig('STREAM_SCALE', fileConfig.streamScale, profile.streamScale)),
     // V15 video compression without native deps:
     // IMAGE_QUALITY >= 90 => rgba 32-bit, >= 45 => rgb565 16-bit, <45 => rgb332 8-bit.
     // Or set VIDEO_CODEC=rgba|rgb565|rgb332 explicitly.
-    imageQuality: Math.max(1, Math.min(100, intConfig('IMAGE_QUALITY', fileConfig.imageQuality, 65))),
-    videoCodec: String(process.env.VIDEO_CODEC || fileConfig.videoCodec || '').toLowerCase(),
-    webpQuality: Math.max(1, Math.min(100, intConfig('WEBP_QUALITY', fileConfig.webpQuality, 55))),
+    imageQuality: Math.max(1, Math.min(100, intConfig('IMAGE_QUALITY', fileConfig.imageQuality, profile.imageQuality))),
+    videoCodec: String(process.env.VIDEO_CODEC || fileConfig.videoCodec || profile.videoCodec).toLowerCase(),
+    webpQuality: Math.max(1, Math.min(100, intConfig('WEBP_QUALITY', fileConfig.webpQuality, profile.webpQuality))),
     webpEffort: Math.max(0, Math.min(6, intConfig('WEBP_EFFORT', fileConfig.webpEffort, 0))),
-    maxWsBufferedAmount: intConfig('MAX_WS_BUFFERED', fileConfig.maxWsBufferedAmount, 512 * 1024),
-    wsCompression: boolConfig('WS_COMPRESSION', fileConfig.wsCompression, false),
+    maxWsBufferedAmount: intConfig('MAX_WS_BUFFERED', fileConfig.maxWsBufferedAmount, transportProfile === 'local' ? 1024 * 1024 : 512 * 1024),
+    wsCompression: boolConfig('WS_COMPRESSION', fileConfig.wsCompression, profile.wsCompression),
     audioPipe: boolConfig('AUDIO_PIPE', fileConfig.audioPipe, true),
+    audioAdaptiveBuffer: boolConfig('AUDIO_ADAPTIVE_BUFFER', fileConfig.audioAdaptiveBuffer, true),
 
     frameResyncLog: boolConfig('FRAME_RESYNC_LOG', fileConfig.frameResyncLog, false),
     audioDebugLog: boolConfig('AUDIO_DEBUG_LOG', fileConfig.audioDebugLog, false),
     // V24: gom PCM audio thành packet lớn hơn để giảm WebSocket overhead và jitter.
-    audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, 40))),
-    audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, 180))),
+    audioPacketMs: Math.max(10, Math.min(120, intConfig('AUDIO_PACKET_MS', fileConfig.audioPacketMs, profile.audioPacketMs))),
+    audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, profile.audioStartBufferMs))),
+    clientAudioMinBufferMs: Math.max(40, Math.min(500, intConfig('CLIENT_AUDIO_MIN_BUFFER_MS', fileConfig.clientAudioMinBufferMs, profile.audioMinBufferMs))),
+    clientAudioMaxBufferMs: Math.max(80, Math.min(1000, intConfig('CLIENT_AUDIO_MAX_BUFFER_MS', fileConfig.clientAudioMaxBufferMs, profile.audioMaxBufferMs))),
     // V24: optional Opus/WebM HTTP audio stream. Requires ffmpeg.
-    audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || 'opus').toLowerCase(),
-    opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || '64k'),
+    audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || profile.audioCodec).toLowerCase(),
+    opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || profile.opusBitrate),
     ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
+    javaBackendHost: process.env.JAVA_BACKEND_HOST || fileConfig.javaBackendHost || '127.0.0.1',
+    javaBackendPort: intConfig('JAVA_BACKEND_PORT', fileConfig.javaBackendPort, 35555),
+    javaBackendRestartDelayMs: intConfig('JAVA_BACKEND_RESTART_DELAY_MS', fileConfig.javaBackendRestartDelayMs, 1500),
+    javaBackendHandshakeTimeoutMs: intConfig('JAVA_BACKEND_HANDSHAKE_TIMEOUT_MS', fileConfig.javaBackendHandshakeTimeoutMs, 10000),
 
     maxActiveSessions: intConfig('MAX_ACTIVE_SESSIONS', fileConfig.maxActiveSessions, 8),
     sessionIdleMs: intConfig('SESSION_IDLE_MS', fileConfig.sessionIdleMs, 10 * 60 * 1000),
@@ -209,6 +306,7 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
+if (CONFIG.clientAudioMaxBufferMs < CONFIG.clientAudioMinBufferMs) CONFIG.clientAudioMaxBufferMs = CONFIG.clientAudioMinBufferMs;
 if (!['rgba', 'rgb565', 'rgb332', 'webp'].includes(CONFIG.videoCodec)) {
   CONFIG.videoCodec = CONFIG.imageQuality >= 90 ? 'rgba' : (CONFIG.imageQuality >= 45 ? 'rgb565' : 'rgb332');
 }
@@ -221,7 +319,9 @@ if (!CONFIG.ffmpegPath || CONFIG.ffmpegPath === 'ffmpeg') {
   if (fs.existsSync(localFfmpeg)) CONFIG.ffmpegPath = localFfmpeg;
 }
 const AUDIO_MAGIC = Buffer.from('FJ2A');
+const SERVER_LOCK_PATH = path.join(CONFIG.dataDir, `server-${CONFIG.port}.lock.json`);
 let wss = null;
+let javaBackend = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
 const publicSessionIds = new Map(); // publicId -> EmulatorSession for /audio/:id.webm
 
@@ -381,16 +481,49 @@ function shouldCheckExecutablePath(cmd) {
   if (!cmd || cmd === 'java' || cmd === 'java.exe') return false;
   return path.isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\');
 }
+function isPidAlive(pid) {
+  if (!pid || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return false; }
+}
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+async function terminateChildProcessTree(proc, label = 'child') {
+  if (!proc || !proc.pid) return;
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  const pid = proc.pid;
+  const exited = new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(true); } };
+    proc.once('exit', finish);
+    proc.once('close', finish);
+    setTimeout(() => { if (!done) resolve(false); }, 4500);
+  });
+
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    } else {
+      try { proc.kill('SIGTERM'); } catch (e) {}
+    }
+  } catch (e) {}
+
+  const graceful = await exited;
+  if (!graceful && process.platform !== 'win32') {
+    try { proc.kill('SIGKILL'); } catch (e) {}
+    await Promise.race([exited, wait(1000)]);
+  }
+  console.log(`[PROC] ${label} pid=${pid} terminated=${!isPidAlive(pid)}`);
+}
 function parseJavaMajor(versionText) {
-  // Handles: 1.8.0_x, 8, 11.0.x, 17.0.x
+  // Handles: 1.8.0_x, 8, 11, 11.0.x, 17.0.x
   const text = String(versionText || '');
-  let m = text.match(/version\s+"(\d+)\.(\d+)/i);
+  let m = text.match(/version\s+"(\d+)(?:\.(\d+))?/i);
   if (m) {
     const first = parseInt(m[1], 10);
-    const second = parseInt(m[2], 10);
+    const second = m[2] ? parseInt(m[2], 10) : 0;
     return first === 1 ? second : first;
   }
-  m = text.match(/openjdk\s+(\d+)/i) || text.match(/java\s+(\d+)/i);
+  m = text.match(/openjdk version\s+"(\d+)/i) || text.match(/java version\s+"(\d+)/i) || text.match(/openjdk\s+(\d+)/i) || text.match(/java\s+(\d+)/i);
   return m ? parseInt(m[1], 10) : 0;
 }
 
@@ -414,6 +547,65 @@ function validateRuntimePaths() {
     if (head.includes('git-lfs.github.com/spec')) throw new Error(`File ${CONFIG.freej2meJar} đang là Git LFS pointer. Chạy git lfs pull.`);
   }
 }
+
+function acquireServerLock() {
+  ensureDir(path.dirname(SERVER_LOCK_PATH));
+  if (fs.existsSync(SERVER_LOCK_PATH)) {
+    try {
+      const old = JSON.parse(fs.readFileSync(SERVER_LOCK_PATH, 'utf8'));
+      if (old && old.pid && old.pid !== process.pid && isPidAlive(old.pid)) {
+        throw new Error(`Server đã chạy sẵn (pid=${old.pid}, port=${old.port || CONFIG.port}). Hãy tắt instance cũ trước khi mở instance mới.`);
+      }
+    } catch (e) {
+      if (String(e.message || '').includes('Server đã chạy sẵn')) throw e;
+    }
+  }
+  fs.writeFileSync(SERVER_LOCK_PATH, JSON.stringify({ pid: process.pid, port: CONFIG.port, startedAt: now(), javaPath: CONFIG.javaPath, jar: CONFIG.freej2meJar }, null, 2));
+}
+
+function releaseServerLock() {
+  try {
+    if (!fs.existsSync(SERVER_LOCK_PATH)) return;
+    const current = JSON.parse(fs.readFileSync(SERVER_LOCK_PATH, 'utf8'));
+    if (!current || !current.pid || current.pid === process.pid) fs.rmSync(SERVER_LOCK_PATH, { force: true });
+  } catch (e) {}
+}
+
+let shutdownStarted = false;
+async function shutdownServer(signal = 'exit', exitCode = 0) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  try {
+    for (const sess of emulatorSessions.values()) await sess.destroySession(`server-${signal}`);
+  } catch (e) {
+    console.warn('[Shutdown] session stop failed:', e.message);
+  }
+  try {
+    if (javaBackend) await javaBackend.stop(signal);
+  } catch (e) {
+    console.warn('[Shutdown] java backend stop failed:', e.message);
+  }
+  releaseServerLock();
+  if (signal !== 'exit') process.exit(exitCode);
+}
+
+process.on('exit', () => { releaseServerLock(); });
+['SIGINT', 'SIGTERM', 'SIGBREAK'].forEach(sig => {
+  process.on(sig, () => {
+    shutdownServer(sig, 0).catch(e => {
+      console.error('[Shutdown]', e);
+      releaseServerLock();
+      process.exit(1);
+    });
+  });
+});
+process.on('uncaughtException', (err) => {
+  try { console.error('uncaughtException:', err); } catch (e) {}
+  shutdownServer('uncaughtException', 1).catch(() => {
+    releaseServerLock();
+    process.exit(1);
+  });
+});
 
 
 // =================== JSON DB AUTH ===================
@@ -520,23 +712,132 @@ function waitForProcessExitOrError(proc) {
 }
 function waitMs(ms, message) { return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)); }
 
-// =================== EMULATOR SESSION ===================
+// =================== SINGLE JAVA BACKEND + EMULATOR SESSION ===================
+class JavaBackend {
+  constructor() {
+    this.process = null;
+    this.ready = false;
+    this.shouldRun = false;
+    this.startPromise = null;
+    this.restartTimer = null;
+    this.restartAttempt = 0;
+    this.sessions = new Set();
+  }
+
+  registerSession(session) { this.sessions.add(session); }
+  unregisterSession(session) { this.sessions.delete(session); }
+
+  async waitUntilReady(timeoutMs = CONFIG.javaBackendHandshakeTimeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.process && this.process.exitCode !== null) throw new Error('Java backend exited before ready');
+      const ok = await new Promise((resolve) => {
+        const socket = net.createConnection({ host: CONFIG.javaBackendHost, port: CONFIG.javaBackendPort }, () => {
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on('error', () => resolve(false));
+      });
+      if (ok) return true;
+      await wait(250);
+    }
+    throw new Error(`Timeout waiting Java backend on ${CONFIG.javaBackendHost}:${CONFIG.javaBackendPort}`);
+  }
+
+  async ensureRunning() {
+    if (this.ready && this.process && this.process.exitCode === null) return true;
+    if (this.startPromise) return this.startPromise;
+    this.shouldRun = true;
+    this.startPromise = (async () => {
+      validateRuntimePaths();
+      if (!this.process || this.process.exitCode !== null) {
+        const args = ['-Djava.awt.headless=true', ...(CONFIG.audioPipe ? ['-Dfreej2me.audioPipe=1'] : []), '-cp', CONFIG.freej2meJar, 'org.recompile.freej2me.transport.WebSocketMain', String(CONFIG.javaBackendPort)];
+        console.log(`[JavaBackend] spawn: ${CONFIG.javaPath} ${args.join(' ')}`);
+        this.process = spawn(CONFIG.javaPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, cwd: path.dirname(CONFIG.freej2meJar) });
+        this.ready = false;
+        this.process.stdout.on('data', chunk => {
+          const text = chunk.toString('utf8').trim();
+          if (text) console.log(`[JavaBackend stdout] ${text}`);
+        });
+        this.process.stderr.on('data', chunk => {
+          const text = chunk.toString('utf8').trim();
+          if (text) console.error(`[JavaBackend stderr] ${text}`);
+        });
+        this.process.on('exit', (code, signal) => {
+          console.warn(`[JavaBackend] exited code=${code} signal=${signal || 'none'}`);
+          this.ready = false;
+          this.startPromise = null;
+          const oldProc = this.process;
+          this.process = null;
+          for (const session of this.sessions) session.onBackendProcessExit(code, signal);
+          if (this.shouldRun) this.scheduleRestart();
+          if (oldProc) oldProc.removeAllListeners();
+        });
+        this.process.on('error', (err) => {
+          console.error('[JavaBackend] process error:', err.message);
+        });
+      }
+      await this.waitUntilReady();
+      this.ready = true;
+      this.restartAttempt = 0;
+      console.log(`[JavaBackend] ready on ws://${CONFIG.javaBackendHost}:${CONFIG.javaBackendPort}`);
+      return true;
+    })();
+    try { return await this.startPromise; }
+    finally { if (this.ready) this.startPromise = null; }
+  }
+
+  scheduleRestart() {
+    if (this.restartTimer || !this.shouldRun) return;
+    this.restartAttempt++;
+    const delay = Math.min(15000, CONFIG.javaBackendRestartDelayMs * Math.pow(2, Math.min(this.restartAttempt - 1, 4)));
+    console.warn(`[JavaBackend] scheduling restart in ${delay}ms`);
+    this.restartTimer = setTimeout(async () => {
+      this.restartTimer = null;
+      try {
+        await this.ensureRunning();
+        for (const session of this.sessions) session.onBackendAvailable();
+      } catch (e) {
+        console.error('[JavaBackend] restart failed:', e.message);
+        this.scheduleRestart();
+      }
+    }, delay);
+  }
+
+  async stop(reason = 'shutdown') {
+    this.shouldRun = false;
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+    this.ready = false;
+    const proc = this.process;
+    this.process = null;
+    this.startPromise = null;
+    if (proc) await terminateChildProcessTree(proc, `java-backend/${reason}`);
+  }
+}
+
 class EmulatorSession {
   constructor({ user, gameHash, jarPath }) {
     this.user = user; this.userId = user.id; this.username = user.username; this.gameHash = gameHash; this.jarPath = jarPath;
     this.key = `${this.userId}:${gameHash}`;
     this.publicId = randomId('s_');
+    this.backendSessionId = `sess_${safeName(this.userId)}_${safeName(gameHash)}`;
     publicSessionIds.set(this.publicId, this);
     this.clients = new Set();
     this.audioHttpClients = new Set();
     this.ffmpeg = null;
     this.ffmpegReady = false;
     this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
-    this.process = null; this.stdoutReader = null; this.stdin = null;
-    this.isRunning = false; this.frameLoopActive = false;
+    this.isRunning = false;
+    this.backendWs = null;
+    this.backendConnected = false;
+    this.backendConnectPromise = null;
+    this.backendReconnectTimer = null;
+    this.frameRequestTimer = null;
+    this.closing = false;
+    this.desiredEncoding = 'ISO_8859_1';
     this.emuFrameWidth = CONFIG.width; this.emuFrameHeight = CONFIG.height;
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
-    this.stopOpusEncoder(); this.opusAudioEnabled = CONFIG.audioCodec === 'opus'; this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null;
+    this.currentAudioFormat = null;
     this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 };
     this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 };
     this.audioPcmChunks = [];
@@ -548,18 +849,49 @@ class EmulatorSession {
   }
 
   touch() { this.lastActivity = now(); }
-  sendPacket(buf) { if (this.stdin && !this.stdin.destroyed) this.stdin.write(buf); }
-  sendKeyDown(keyIndex) { const b = Buffer.alloc(5); b[0] = 3; b.writeInt32BE(keyIndex, 1); this.sendPacket(b); }
-  sendKeyUp(keyIndex) { const b = Buffer.alloc(5); b[0] = 2; b.writeInt32BE(keyIndex, 1); this.sendPacket(b); }
-  sendMouse(cmd, x, y) { const b = Buffer.alloc(5); b[0] = cmd; b[1] = (x >> 8) & 255; b[2] = x & 255; b[3] = (y >> 8) & 255; b[4] = y & 255; this.sendPacket(b); }
-  sendLoadJar(jarPath) { const pb = Buffer.from(jarPath, 'utf8'); const h = Buffer.alloc(5); h[0] = 10; h.writeInt32BE(pb.length, 1); this.sendPacket(h); this.sendPacket(pb); console.log(`[PROTO ${this.username}] Load JAR:`, jarPath, `(len=${pb.length})`); }
-  sendFrameRequest() { const b = Buffer.alloc(5); b[0] = 15; this.sendPacket(b); }
+  buildRawCommand(cmd, value) {
+    const b = Buffer.alloc(5);
+    b[0] = cmd & 0xFF;
+    b.writeInt32BE(value, 1);
+    return b;
+  }
+  sendPacket(buf) {
+    if (this.backendWs && this.backendWs.readyState === WebSocket.OPEN) {
+      this.backendWs.send(buf, { binary: true, compress: false });
+      return true;
+    }
+    return false;
+  }
+  sendKeyDown(keyIndex) { return this.sendPacket(this.buildRawCommand(3, keyIndex)); }
+  sendKeyUp(keyIndex) { return this.sendPacket(this.buildRawCommand(2, keyIndex)); }
+  sendMouse(cmd, x, y) {
+    const b = Buffer.alloc(5);
+    b[0] = cmd;
+    b[1] = (x >> 8) & 255; b[2] = x & 255; b[3] = (y >> 8) & 255; b[4] = y & 255;
+    return this.sendPacket(b);
+  }
+  sendFrameRequest() { return this.sendPacket(Buffer.from([15, 0, 0, 0, 0])); }
 
   broadcast(data, opts = {}) { for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data, opts); }
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
-  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...extra }; }
+  getClientAudioTuning() {
+    return {
+      transportProfile: CONFIG.transportProfile,
+      audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer,
+      audioPacketMs: CONFIG.audioPacketMs,
+      audioStartBufferMs: CONFIG.audioStartBufferMs,
+      clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs,
+      clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs,
+      audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm',
+    };
+  }
+  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...this.getClientAudioTuning(), ...extra }; }
   getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) { return { width: Math.max(1, Math.floor(width / CONFIG.streamScale)), height: Math.max(1, Math.floor(height / CONFIG.streamScale)) }; }
-  broadcastConfig() { const d = this.getStreamDimensions(); this.streamOutWidth = d.width; this.streamOutHeight = d.height; this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }); }
+  broadcastConfig() {
+    const d = this.getStreamDimensions();
+    this.streamOutWidth = d.width; this.streamOutHeight = d.height;
+    this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, ...this.getClientAudioTuning() });
+  }
 
   cancelNoClientShutdown() {
     if (this.noClientTimer) clearTimeout(this.noClientTimer);
@@ -572,7 +904,7 @@ class EmulatorSession {
     this.noClientTimer = setTimeout(() => {
       if (this.clients.size === 0) {
         console.log(`[SESSION ${this.username}] auto shutdown: ${reason}, idle ${CONFIG.noClientShutdownMs}ms`);
-        this.cleanupProcess();
+        this.cleanupProcess('no-clients');
         emulatorSessions.delete(this.key);
         if (this.publicId) publicSessionIds.delete(this.publicId);
       }
@@ -586,7 +918,7 @@ class EmulatorSession {
       if (now() - this.lastInputAt >= CONFIG.inputIdleShutdownMs) {
         console.log(`[SESSION ${this.username}] input idle shutdown after ${CONFIG.inputIdleShutdownMs}ms`);
         this.broadcastJson({ type: 'status', state: 'input-idle-shutdown' });
-        this.cleanupProcess();
+        this.cleanupProcess('input-idle');
         emulatorSessions.delete(this.key);
         if (this.publicId) publicSessionIds.delete(this.publicId);
       }
@@ -608,7 +940,7 @@ class EmulatorSession {
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
     ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null, audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm' }));
     ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, ...this.getClientAudioTuning() }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => {
       this.clients.delete(ws);
@@ -629,7 +961,6 @@ class EmulatorSession {
     const outHeight = scale <= 1 ? height : Math.max(1, Math.floor(height / scale));
     const codec = CONFIG.videoCodec;
 
-    // Optional WebP via sharp. Excellent for bandwidth, costs CPU/latency.
     if (codec === 'webp' && sharp) {
       const raw = Buffer.allocUnsafe(outWidth * outHeight * 3);
       let dst = 0;
@@ -690,27 +1021,6 @@ class EmulatorSession {
       }
     }
     return out;
-  }
-
-  async readFrameHeader() {
-    let skipped = 0;
-    while (this.frameLoopActive && this.isRunning) {
-      const first = await this.stdoutReader.readBytes(1);
-      if (first[0] !== 0xFE) { skipped++; continue; }
-      const rest = await this.stdoutReader.readBytes(15);
-      const header = Buffer.concat([first, rest]);
-      const width = (header[1] << 8) | header[2];
-      const height = (header[3] << 8) | header[4];
-      const frameSize = width * height * 3;
-      if (header[14] === 1) return header;
-      if (width > 0 && height > 0 && frameSize <= 800 * 800 * 3) {
-        if (skipped && CONFIG.frameResyncLog) console.warn(`[FRAME ${this.username}] resync skipped ${skipped} bytes`);
-        return header;
-      }
-      const idx = rest.indexOf(0xFE);
-      if (idx !== -1) this.stdoutReader.prepend(rest.slice(idx));
-    }
-    throw new Error('Frame loop stopped');
   }
 
   startOpusEncoder() {
@@ -841,143 +1151,250 @@ class EmulatorSession {
     }
   }
 
-  logAudioText(buf) {
-    if (!buf || !buf.length) return;
-    const text = buf.toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]+/g, '').trim();
-    if (text && (CONFIG.audioDebugLog || text.includes('[AudioPipe'))) console.error(`[EMU stderr ${this.username}]`, text);
-  }
-  attachAudioPipe(stderrStream) {
-    if (!stderrStream) return;
-    stderrStream.on('data', chunk => {
-      if (!CONFIG.audioPipe) { this.logAudioText(chunk); return; }
-      this.audioPipeBuffer = Buffer.concat([this.audioPipeBuffer, chunk]);
-      while (this.audioPipeBuffer.length > 0) {
-        const idx = this.audioPipeBuffer.indexOf(AUDIO_MAGIC);
-        if (idx < 0) { if (this.audioPipeBuffer.length > 3) { this.logAudioText(this.audioPipeBuffer.slice(0, this.audioPipeBuffer.length - 3)); this.audioPipeBuffer = this.audioPipeBuffer.slice(-3); } return; }
-        if (idx > 0) { this.logAudioText(this.audioPipeBuffer.slice(0, idx)); this.audioPipeBuffer = this.audioPipeBuffer.slice(idx); }
-        if (this.audioPipeBuffer.length < 5) return;
-        const type = this.audioPipeBuffer[4];
-        if (type === 1) {
-          if (this.audioPipeBuffer.length < 13) return;
-          const packet = Buffer.from(this.audioPipeBuffer.slice(0, 13));
-          this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
-          this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
-          this.flushAudioPcm();
-          this.stopOpusEncoder();
-          this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
-          console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
-          if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
-          this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
-          if (this.opusAudioEnabled) this.startOpusEncoder();
-          this.audioPipeBuffer = this.audioPipeBuffer.slice(13); continue;
-        }
-        if (type === 2) {
-          if (this.audioPipeBuffer.length < 9) return;
-          const len = this.audioPipeBuffer.readUInt32BE(5);
-          if (len > 1024 * 1024) { this.audioPipeBuffer = this.audioPipeBuffer.slice(1); continue; }
-          const total = 9 + len; if (this.audioPipeBuffer.length < total) return;
-          const payload = Buffer.from(this.audioPipeBuffer.slice(9, total));
-          this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-          if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${CONFIG.audioPacketMs}ms`);
-          if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
-          this.audioPipeBuffer = this.audioPipeBuffer.slice(total); continue;
-        }
-        this.audioPipeBuffer = this.audioPipeBuffer.slice(1);
-      }
-    });
+  buildBackendConfig() {
+    return {
+      sessionId: this.backendSessionId,
+      dataDir: path.resolve(this.dataDir),
+      jar: path.resolve(this.jarPath),
+      encoding: this.desiredEncoding || 'ISO_8859_1',
+      width: CONFIG.width,
+      height: CONFIG.height,
+      rotate: CONFIG.rotate,
+      phone: CONFIG.phoneType,
+      fps: CONFIG.fps,
+      sound: CONFIG.sound,
+      midi: 0,
+      dumpAudio: 0,
+      logLevel: 2,
+      noAlpha: 1,
+      backlight: 1,
+      fantasyZone: 0,
+      transToOrigin: 0,
+      textFont: 0,
+      fontOffset: 0,
+      dumpGraphics: 0,
+      deleteKJX: 1,
+      M3GUntextured: 0,
+      M3GWireframe: 0,
+      fpsHack: 0,
+      immediateRepaints: 0,
+      overridePlatform: 1,
+      siemensFriendly: 0,
+      M3GHalfRes: 0,
+      DoJaVersion: 200,
+      ignoreVolume: 0,
+      MCV3HalfRes: 0,
+      MCV3NoLight: 0,
+      MCV3HFOV: 0,
+      MCV3Heap: 0,
+      MCV3Time: 0,
+      fontOffset2: 0,
+    };
   }
 
-  cleanupProcess() {
-    this.frameLoopActive = false; this.isRunning = false;
+  startFramePump() {
+    if (this.frameRequestTimer) clearInterval(this.frameRequestTimer);
+    const interval = Math.max(25, Math.floor(1000 / Math.max(1, CONFIG.maxFps || 30)));
+    this.frameRequestTimer = setInterval(() => {
+      if (!this.backendConnected) return;
+      if (this.clients.size === 0) return;
+      this.sendFrameRequest();
+    }, interval);
+    this.sendFrameRequest();
+  }
+
+  stopFramePump() {
+    if (this.frameRequestTimer) clearInterval(this.frameRequestTimer);
+    this.frameRequestTimer = null;
+  }
+
+  onBackendProcessExit(code, signal) {
+    this.backendConnected = false;
+    this.isRunning = false;
+    this.stopFramePump();
+    this.broadcastJson({ type: 'status', state: 'java-backend-down', reason: `${code}:${signal || 'none'}` });
+  }
+
+  onBackendAvailable() {
+    if (!this.closing) this.scheduleBackendReconnect('backend-available');
+  }
+
+  scheduleBackendReconnect(reason = 'backend-reconnect') {
+    if (this.closing) return;
+    if (this.backendReconnectTimer) return;
+    this.broadcastJson({ type: 'status', state: 'backend-reconnecting', reason, gameHash: this.gameHash });
+    this.backendReconnectTimer = setTimeout(async () => {
+      this.backendReconnectTimer = null;
+      try {
+        await this.connectBackend();
+      } catch (e) {
+        console.warn(`[SESSION ${this.username}] reconnect failed:`, e.message);
+        this.scheduleBackendReconnect('retry');
+      }
+    }, Math.max(500, CONFIG.javaBackendRestartDelayMs));
+  }
+
+  async closeBackendConnection(reason = 'close') {
+    this.backendConnected = false;
+    this.isRunning = false;
+    this.stopFramePump();
+    const ws = this.backendWs;
+    this.backendWs = null;
+    this.backendConnectPromise = null;
+    if (this.backendReconnectTimer) { clearTimeout(this.backendReconnectTimer); this.backendReconnectTimer = null; }
+    if (ws) {
+      try { ws.removeAllListeners(); ws.close(); } catch (e) {}
+      if (ws.readyState !== WebSocket.CLOSED) {
+        await new Promise(resolve => {
+          const done = () => resolve();
+          ws.once('close', done);
+          setTimeout(() => { try { ws.terminate(); } catch (e) {} resolve(); }, 1000);
+        });
+      }
+    }
+  }
+
+  async connectBackend() {
+    if (this.closing) return false;
+    if (this.backendConnected && this.backendWs && this.backendWs.readyState === WebSocket.OPEN) return true;
+    if (this.backendConnectPromise) return this.backendConnectPromise;
+    this.backendConnectPromise = (async () => {
+      await javaBackend.ensureRunning();
+      await this.closeBackendConnection('reconnect');
+      ensureDir(this.dataDir);
+      console.log(`[EMU ${this.username}] connect backend session=${this.backendSessionId} dataDir=${this.dataDir}`);
+      const url = `ws://${CONFIG.javaBackendHost}:${CONFIG.javaBackendPort}`;
+      const ws = new WebSocket(url, { handshakeTimeout: CONFIG.javaBackendHandshakeTimeoutMs, perMessageDeflate: false });
+      this.backendWs = ws;
+      await new Promise((resolve, reject) => {
+        const fail = (err) => reject(err || new Error('backend ws failed'));
+        ws.once('open', resolve);
+        ws.once('error', fail);
+        ws.once('close', () => fail(new Error('backend ws closed before open')));
+      });
+      ws.on('message', (data, isBinary) => {
+        try {
+          if (isBinary) {
+            const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
+            if (packet.length >= 4 && packet.slice(0, 4).equals(AUDIO_MAGIC)) this.handleBackendAudioPacket(packet);
+            else if (packet.length >= 16 && packet[0] === 0xFE) this.handleBackendFramePacket(packet).catch(e => console.error(`[FRAME ${this.username}]`, e.message));
+          } else {
+            const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+            if (text) {
+              console.log(`[JavaBackend msg ${this.username}] ${text}`);
+              try {
+                const msg = JSON.parse(text);
+                if (msg.error) this.broadcastJson({ type: 'status', state: 'backend-error', error: msg.error });
+              } catch (e) {}
+            }
+          }
+        } catch (e) {
+          console.error(`[SESSION ${this.username}] backend message error:`, e.message);
+        }
+      });
+      ws.on('close', () => {
+        if (this.backendWs === ws) this.backendWs = null;
+        this.backendConnected = false;
+        this.isRunning = false;
+        this.stopFramePump();
+        if (!this.closing) this.scheduleBackendReconnect('ws-close');
+      });
+      ws.on('error', (err) => {
+        console.warn(`[SESSION ${this.username}] backend ws error:`, err.message);
+      });
+      ws.send(JSON.stringify(this.buildBackendConfig()));
+      this.backendConnected = true;
+      this.isRunning = true;
+      this.lastInputAt = now();
+      this.startInputIdleWatchdog();
+      this.broadcastConfig();
+      this.broadcastJson({ type: 'status', state: 'running', gameHash: this.gameHash, backend: 'single-java' });
+      this.startFramePump();
+      setTimeout(() => { if (this.isRunning && CONFIG.audioPipe && this.audioStats.formatPackets === 0) this.broadcastJson(this.getAudioStatus({ event: 'timeout-no-audio', warning: 'no FJ2A audio packet after 5s' })); }, 5000);
+      return true;
+    })();
+    try { return await this.backendConnectPromise; }
+    finally { this.backendConnectPromise = null; }
+  }
+
+  handleBackendAudioPacket(packet) {
+    const type = packet[4];
+    if (type === 1) {
+      if (packet.length < 13) return;
+      this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
+      this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
+      this.flushAudioPcm();
+      this.stopOpusEncoder();
+      this.opusAudioEnabled = CONFIG.audioCodec === 'opus';
+      console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
+      if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
+      this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
+      if (this.opusAudioEnabled) this.startOpusEncoder();
+      return;
+    }
+    if (type === 2) {
+      if (packet.length < 9) return;
+      const len = packet.readUInt32BE(5);
+      if (len > 1024 * 1024 || 9 + len > packet.length) return;
+      const payload = Buffer.from(packet.slice(9, 9 + len));
+      this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
+      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${CONFIG.audioPacketMs}ms`);
+      if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
+    }
+  }
+
+  async handleBackendFramePacket(packet) {
+    if (packet.length < 16) return;
+    const header = packet.slice(0, 16);
+    const width = (header[1] << 8) | header[2];
+    const height = (header[3] << 8) | header[4];
+    const frameSize = width * height * 3;
+    if (header[14] === 1) {
+      const enc = ['ISO_8859_1', 'Shift_JIS', 'EUC_KR'][header[15]] || 'ISO_8859_1';
+      console.log(`[SESSION ${this.username}] encoding restart requested -> ${enc}`);
+      this.desiredEncoding = enc;
+      this.scheduleBackendReconnect('encoding-restart');
+      return;
+    }
+    if (width <= 0 || height <= 0 || frameSize <= 0 || packet.length < 16 + frameSize) return;
+    this.emuFrameWidth = width; this.emuFrameHeight = height;
+    const dims = this.getStreamDimensions(width, height);
+    if (dims.width !== this.streamOutWidth || dims.height !== this.streamOutHeight) this.broadcastConfig();
+    this.videoStats.framesRead++;
+    this.videoStats.lastFrameAt = now();
+    if (this.countReadyClients() <= 0) return;
+    const rgb24 = packet.slice(16, 16 + frameSize);
+    const videoBuf = await this.convertRgb24ToVideoBuffer(rgb24, width, height);
+    for (const ws of this.clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) {
+          ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
+          this.videoStats.framesSent++;
+        }
+      }
+    }
+  }
+
+  async destroySession(reason = 'cleanup') {
+    this.closing = true;
     this.cancelNoClientShutdown();
     if (this.inputIdleTimer) { clearInterval(this.inputIdleTimer); this.inputIdleTimer = null; }
     this.flushAudioPcm();
     this.stopOpusEncoder();
     if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
-    if (this.process && !this.process.killed) { try { this.process.kill('SIGTERM'); } catch (e) {} }
-    this.process = null; this.stdoutReader = null; this.stdin = null;
+    await this.closeBackendConnection(reason);
+    if (javaBackend) javaBackend.unregisterSession(this);
+  }
+
+  cleanupProcess(reason = 'cleanup') {
+    this.destroySession(reason).catch(e => console.warn(`[SESSION ${this.username}] destroySession failed:`, e.message));
   }
 
   async start(encodingName) {
-    validateRuntimePaths();
-    this.cleanupProcess();
-    await new Promise(r => setTimeout(r, 250));
-    ensureDir(this.dataDir);
-    console.log(`[EMU ${this.username}] start game=${this.gameHash} dataDir=${this.dataDir}`);
-    console.log('[EMU] freej2meJar selected:', CONFIG.freej2meJar);
-    const jvmArgs = [getEncodingJvmArg(encodingName), '-Djava.awt.headless=true', ...(CONFIG.audioPipe ? ['-Dfreej2me.audioPipe=1'] : []), '-jar', CONFIG.freej2meJar];
-    const proc = spawn(CONFIG.javaPath, [...jvmArgs, ...buildArgs()], { stdio: ['pipe', 'pipe', 'pipe'], cwd: this.dataDir });
-    this.process = proc; this.stdin = proc.stdin; this.stdoutReader = new StdoutReader(proc.stdout);
-    this.audioPipeBuffer = Buffer.alloc(0); this.currentAudioFormat = null; this.audioStats = { formatPackets: 0, pcmPackets: 0, pcmBytes: 0, lastFormatAt: 0, lastPcmAt: 0 }; this.videoStats = { framesRead: 0, framesSent: 0, lastFrameAt: 0 }; this.audioPcmChunks = []; this.audioPcmBytes = 0; if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
-    this.attachAudioPipe(proc.stderr);
-    proc.on('exit', code => { if (this.process === proc) { console.log(`[EMU ${this.username}] exited ${code}`); this.cleanupProcess(); } });
-    proc.on('error', err => { if (this.process === proc) { console.error(`[EMU ${this.username}] error:`, err.message); this.cleanupProcess(); } });
-
-    let ready = false;
-    const done = waitForProcessExitOrError(proc);
-    while (!ready) {
-      const line = await Promise.race([this.stdoutReader.readLine(), done, waitMs(15000, 'Timeout đợi +READY')]);
-      const text = String(line).trim(); if (text) console.log(`[EMU stdout ${this.username}]`, text);
-      if (text.includes('+READY')) ready = true;
-    }
-    this.sendLoadJar(this.jarPath);
-    await new Promise(r => setTimeout(r, 1000));
-    this.sendFrameRequest();
-    this.isRunning = true; this.frameLoopActive = true;
-    this.lastInputAt = now();
-    this.startInputIdleWatchdog();
-    this.broadcastConfig();
-    this.broadcastJson({ type: 'status', state: 'running', gameHash: this.gameHash });
-    this.startFrameLoop();
-    setTimeout(() => { if (this.isRunning && CONFIG.audioPipe && this.audioStats.formatPackets === 0) this.broadcastJson(this.getAudioStatus({ event: 'timeout-no-audio', warning: 'no FJ2A audio packet after 5s' })); }, 5000);
-  }
-
-  async startFrameLoop() {
-    const minFrameInterval = CONFIG.maxFps > 0 ? 1000 / CONFIG.maxFps : 0;
-    let lastFrameTime = 0, frameNo = 0, dropBackpressure = 0, lastStats = now();
-    while (this.frameLoopActive && this.isRunning) {
-      try {
-        const header = await this.readFrameHeader();
-        const width = (header[1] << 8) | header[2], height = (header[3] << 8) | header[4];
-        if (header[14] === 1) {
-          const enc = ['ISO-8859-1', 'Shift_JIS', 'EUC-KR'][header[15]] || 'ISO-8859-1';
-          const expected = Math.max(1, this.emuFrameWidth) * Math.max(1, this.emuFrameHeight) * 3;
-          try { await this.stdoutReader.readBytes(expected); } catch (e) {}
-          await this.start(enc); return;
-        }
-        const frameSize = width * height * 3;
-        this.emuFrameWidth = width; this.emuFrameHeight = height;
-        const dims = this.getStreamDimensions(width, height);
-        if (dims.width !== this.streamOutWidth || dims.height !== this.streamOutHeight) this.broadcastConfig();
-        const rgb24 = await this.stdoutReader.readBytes(frameSize);
-        frameNo++;
-        this.videoStats.framesRead++;
-        this.videoStats.lastFrameAt = now();
-        if (minFrameInterval > 0) {
-          const elapsed = now() - lastFrameTime;
-          if (elapsed < minFrameInterval) await new Promise(r => setTimeout(r, minFrameInterval - elapsed));
-          lastFrameTime = now();
-        }
-        if (this.countReadyClients() <= 0) { dropBackpressure++; this.sendFrameRequest(); continue; }
-        const videoBuf = await this.convertRgb24ToVideoBuffer(rgb24, width, height);
-        for (const ws of this.clients) {
-          if (ws.readyState === WebSocket.OPEN) {
-            if (ws.bufferedAmount <= CONFIG.maxWsBufferedAmount) ws.send(videoBuf, { binary: true, compress: CONFIG.wsCompression });
-            else dropBackpressure++;
-          }
-        }
-        if (now() - lastStats >= 10000) {
-          console.log(`[STREAM ${this.username}] fps~${(frameNo / 10).toFixed(1)}, clients=${this.clients.size}, drop=${dropBackpressure}, out=${this.streamOutWidth}x${this.streamOutHeight}`);
-          frameNo = 0; dropBackpressure = 0; lastStats = now();
-        }
-        this.sendFrameRequest();
-      } catch (e) {
-        if (!this.isRunning) break;
-        console.error(`[FRAME ${this.username}]`, e.message);
-        await new Promise(r => setTimeout(r, 100));
-        this.sendFrameRequest();
-      }
-    }
+    this.desiredEncoding = encodingName || this.desiredEncoding || 'ISO_8859_1';
+    this.closing = false;
+    if (javaBackend) javaBackend.registerSession(this);
+    await this.connectBackend();
   }
 }
 
@@ -1188,19 +1605,44 @@ function getPatchedIndexHtml() {
     let opusAudioEl = null;
     let videoCodec = 'rgba';
     let imageQuality = 100;
-    const AUDIO_START_BUFFER_SEC = 0.18; // overwritten by server config not needed; stable default for tunnel jitter
+    let transportProfile = 'local';
+    let audioAdaptiveBuffer = true;
+    let audioPacketMs = 40;
+    let audioStartBufferSec = 0.11;
+    let audioMinBufferSec = 0.07;
+    let audioMaxBufferSec = 0.26;
+    let audioTargetBufferSec = audioStartBufferSec;
+    let audioUnderruns = 0, audioStablePackets = 0, audioDroppedPackets = 0;
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
     function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'playback'}); return audioCtx; }
     function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.16); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.18);}catch(e){} }
-    function startOpusAudio(){ if(!opusAudioUrl) return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioNextTime=ctx.currentTime+AUDIO_START_BUFFER_SEC; setAudioButton('🔊 Âm thanh: bật'); browserTestBeep(); startOpusAudio(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; setAudioButton(audioMuted?'🔇 Âm thanh: tắt':'🔊 Âm thanh: bật'); if(!audioMuted){ audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; browserTestBeep(); startOpusAudio(); } } };
+    function applyAudioTuning(msg){
+      if(!msg) return;
+      transportProfile = msg.transportProfile || transportProfile || 'local';
+      audioAdaptiveBuffer = msg.audioAdaptiveBuffer !== false;
+      audioPacketMs = Math.max(10, Math.min(120, msg.audioPacketMs || audioPacketMs || 40));
+      audioStartBufferSec = clamp((msg.audioStartBufferMs || (transportProfile === 'remote' ? 180 : 110)) / 1000, 0.04, 0.50);
+      audioMinBufferSec = clamp((msg.clientAudioMinBufferMs || (transportProfile === 'remote' ? 120 : 70)) / 1000, 0.04, 0.50);
+      audioMaxBufferSec = clamp((msg.clientAudioMaxBufferMs || (transportProfile === 'remote' ? 420 : 260)) / 1000, audioMinBufferSec, 1.00);
+      audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec);
+    }
+    function resetAudioScheduler(){ if(audioCtx) audioNextTime = audioCtx.currentTime + audioTargetBufferSec; }
+    function refreshAudioButtonTitle(extra){
+      const state = audioUnlocked && !audioMuted ? '🔊 Âm thanh: bật' : '🔇 Bật âm thanh';
+      const codec = opusAudioUrl ? 'opus' : 'pcm';
+      const title = 'codec=' + codec + ' profile=' + transportProfile + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
+      setAudioButton(state, title);
+    }
+    function startOpusAudio(){ if(!opusAudioUrl) return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); refreshAudioButtonTitle(); }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); startOpusAudio(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); startOpusAudio(); } refreshAudioButtonTitle(); } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ if(msg.audioUrl){ opusAudioUrl = msg.audioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } if(msg.format) setAudioButton(audioUnlocked&&!audioMuted?'🔊 Âm thanh: bật':'🔇 Bật âm thanh', 'codec='+(msg.audioCodec||'pcm')+' fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ applyAudioTuning(msg); if(msg.audioUrl){ opusAudioUrl = msg.audioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function handleAudioPacket(u8){
       if(!isAudioPacket(u8)) return false;
       const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
-      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; if(audioCtx) audioNextTime=audioCtx.currentTime+AUDIO_START_BUFFER_SEC; return true; }
+      if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; if(audioCtx) resetAudioScheduler(); refreshAudioButtonTitle('format'); return true; }
       if(type!==2 || u8.length<9) return true;
       const len=dv.getUint32(5,false);
       if(len<=0||9+len>u8.length||!audioUnlocked||audioMuted||!audioCtx||audioFormat.bits!==16) return true;
@@ -1209,9 +1651,23 @@ function getPatchedIndexHtml() {
       const cd=[]; for(let c=0;c<chs;c++) cd[c]=buf.getChannelData(c); let off=9;
       for(let i=0;i<frames;i++){ for(let c=0;c<chs;c++){ let smp=audioFormat.bigEndian?((u8[off]<<8)|u8[off+1]):(u8[off]|(u8[off+1]<<8)); if(audioFormat.signed&&smp>=0x8000)smp-=0x10000; if(!audioFormat.signed)smp-=0x8000; cd[c][i]=Math.max(-1,Math.min(1,smp/32768)); off+=2; } }
       const nowAudio=audioCtx.currentTime;
-      if(!audioNextTime || audioNextTime < nowAudio + 0.04) audioNextTime = nowAudio + AUDIO_START_BUFFER_SEC;
-      // If backlog grows too much, drop this packet rather than playing old audio late.
-      if(audioNextTime > nowAudio + 0.9) return true;
+      if(!audioNextTime || audioNextTime < nowAudio + 0.02) {
+        audioUnderruns++;
+        audioStablePackets = 0;
+        if(audioAdaptiveBuffer) audioTargetBufferSec = clamp(audioTargetBufferSec + 0.03, audioMinBufferSec, audioMaxBufferSec);
+        audioNextTime = nowAudio + audioTargetBufferSec;
+      } else if(audioAdaptiveBuffer) {
+        const bufferedAhead = audioNextTime - nowAudio;
+        if(bufferedAhead < audioMinBufferSec * 0.75) audioTargetBufferSec = clamp(audioTargetBufferSec + 0.015, audioMinBufferSec, audioMaxBufferSec);
+        else {
+          audioStablePackets++;
+          if(audioStablePackets >= Math.max(8, Math.round(240 / audioPacketMs)) && audioTargetBufferSec > audioMinBufferSec) {
+            audioTargetBufferSec = clamp(audioTargetBufferSec - 0.005, audioMinBufferSec, audioMaxBufferSec);
+            audioStablePackets = 0;
+          }
+        }
+      }
+      if(audioNextTime > nowAudio + Math.max(audioMaxBufferSec + 0.15, 0.9)) { audioDroppedPackets++; refreshAudioButtonTitle('drop-backlog'); return true; }
       const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination);
       src.start(audioNextTime); audioNextTime += buf.duration;
       return true;
@@ -1269,7 +1725,7 @@ function getPatchedIndexHtml() {
   // V24: nhận videoCodec/imageQuality từ config packet. Bản V15 thiếu đoạn này nên client tưởng frame là RGBA và bị đen màn hình.
   html = html.replace(
     '            screenHeight = msg.height;\n            canvas.width = screenWidth;',
-    "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            canvas.width = screenWidth;"
+    "            screenHeight = msg.height;\n            videoCodec = msg.videoCodec || videoCodec || 'rgba';\n            imageQuality = msg.imageQuality || imageQuality || 100;\n            applyAudioTuning(msg);\n            refreshAudioButtonTitle();\n            canvas.width = screenWidth;"
   );
 
   // V24: connection guard để tránh kẹt noGame và tránh tạo 2 socket/audio chồng.
@@ -1390,17 +1846,21 @@ function startWebServer() {
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
+  console.log(`[Stream] mode=single-java profile=${CONFIG.transportProfile}, maxFps=${CONFIG.maxFps}, scale=${CONFIG.streamScale}, videoCodec=${CONFIG.videoCodec}, imageQuality=${CONFIG.imageQuality}, webpQuality=${CONFIG.webpQuality}, sharp=${sharp ? 'on' : 'off'}, wsCompression=${CONFIG.wsCompression ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, audioCodec=${CONFIG.audioCodec}, opusBitrate=${CONFIG.opusBitrate}, audioPacketMs=${CONFIG.audioPacketMs}, audioStartBufferMs=${CONFIG.audioStartBufferMs}, clientAudioMinBufferMs=${CONFIG.clientAudioMinBufferMs}, clientAudioMaxBufferMs=${CONFIG.clientAudioMaxBufferMs}, adaptiveAudio=${CONFIG.audioAdaptiveBuffer ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
-  console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
+  console.log(`[Runtime] sharedJar=${CONFIG.freej2meJar}`);
+  console.log(`[Runtime] javaBackend=ws://${CONFIG.javaBackendHost}:${CONFIG.javaBackendPort}`);
 
   wss.on('connection', (ws, req) => {
     const user = db.getUserBySession(parseCookies(req).fj2me_sid);
     if (!user) { ws.send(JSON.stringify({ type: 'error', error: 'not_logged_in' })); ws.close(); return; }
     ws._userId = user.id;
     const sess = getActiveSessionForUser(user.id);
-    if (!sess) { ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true })); ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality })); }
+    if (!sess) {
+      ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true }));
+      ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / CONFIG.streamScale), height: Math.floor(CONFIG.height / CONFIG.streamScale), scale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, transportProfile: CONFIG.transportProfile, audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer, audioPacketMs: CONFIG.audioPacketMs, audioStartBufferMs: CONFIG.audioStartBufferMs, clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs, clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs, audioCodec: CONFIG.audioCodec }));
+    }
     else sess.addClient(ws);
     ws.on('message', msg => {
       try {
@@ -1417,5 +1877,15 @@ function startWebServer() {
 }
 
 // =================== MAIN ===================
-async function main() { ensureDir(CONFIG.uploadsDir); ensureDir(CONFIG.dataDir); validateRuntimePaths(); runStorageCleanup(); setInterval(runStorageCleanup, CONFIG.cleanupIntervalMs); startWebServer(); }
-main().catch(err => { console.error('Lỗi nghiêm trọng:', err); process.exit(1); });
+async function main() {
+  ensureDir(CONFIG.uploadsDir);
+  ensureDir(CONFIG.dataDir);
+  acquireServerLock();
+  validateRuntimePaths();
+  javaBackend = new JavaBackend();
+  await javaBackend.ensureRunning();
+  runStorageCleanup();
+  setInterval(runStorageCleanup, CONFIG.cleanupIntervalMs);
+  startWebServer();
+}
+main().catch(err => { console.error('Lỗi nghiêm trọng:', err); releaseServerLock(); process.exit(1); });
