@@ -22,6 +22,9 @@ const http = require('http');
 const WebSocket = require('ws');
 let sharp = null;
 try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
+
+// ===== MỞ RỘNG TÍCH HỢP freej2me-web (CheerpJ) =====
+const fj2meBridge = (() => { try { return require('./fj2me-bridge'); } catch (e) { console.warn('[fj2me-bridge] require failed:', e.message); return null; } })();
 let helmet = null, cors = null, expressRateLimit = null, systeminformation = null;
 try { helmet = require('helmet'); } catch(e) {}
 try { cors = require('cors'); } catch(e) {}
@@ -205,6 +208,20 @@ function loadConfig() {
     uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, 'uploads'),
     dataDir: process.env.DATA_DIR || path.join(__dirname, 'freej2me_data'),
     dbPath: process.env.DB_PATH || path.join(__dirname, 'freej2me_data', 'users.json'),
+
+    // ===== MỞ RỘNG TÍCH HỢP freej2me-web (CheerpJ) =====
+    // Bridge section + perGame config được merge từ raw fileConfig.
+    // Nếu không có thì default bridge.enabled = false để không break behavior cũ.
+    bridge: Object.assign({
+      enabled: false, publicUrl: '', sharedSecret: '', protocol: 'ws',
+      autoFallbackOnCheerpjCrash: false, phpApiEnabled: true, phpApiPath: '/bridge/api',
+      corsOrigins: [], streamScale: 1, videoCodec: '', imageQuality: 65,
+      audioCodec: 'opus', gamesDir: path.join(__dirname, 'freej2me_data', 'bridge_games'),
+      keepUploadsDays: 30,
+      mysql: { enabled: false, host: 'localhost', port: 3306, user: '', password: '', database: '', charset: 'utf8mb4' },
+      phpCompat: { enabled: true, acceptPhpSessionCookie: true, phpSessionCookieName: 'PHPSESSID', responseEnvelope: 'php' },
+    }, fileConfig.bridge || {}),
+    perGame: fileConfig.perGame || {},
   };
 }
 
@@ -1394,6 +1411,24 @@ function startWebServer() {
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] jar=${CONFIG.freej2meJar}`);
+
+  // ===== MỞ RỘNG TÍCH HỢP freej2me-web (CheerpJ) =====
+  if (fj2meBridge && CONFIG.bridge && CONFIG.bridge.enabled) {
+    try {
+      fj2meBridge.mountBridge({
+        app, wss, WebSocket, db, CONFIG,
+        requireUserFn: requireUser,
+        getIpFn: getIp,
+        parseCookiesFn: parseCookies,
+        memoryRateLimitFn: memoryRateLimit,
+        sharpLib: sharp,
+        rootConfigPath: path.join(__dirname, 'config.json'),
+      });
+      console.log('[fj2me-bridge] mounted OK');
+    } catch (e) {
+      console.warn('[fj2me-bridge] mount failed:', e.message);
+    }
+  }
 
   wss.on('connection', (ws, req) => {
     const user = db.getUserBySession(parseCookies(req).fj2me_sid);

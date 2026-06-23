@@ -1,17 +1,99 @@
 {
-  "comment": "Cấu hình đường dẫn cho freej2me-lr-web-bridge. Có thể dùng đường dẫn tuyệt đối hoặc tương đối (tính từ thư mục project).",
+  "comment": "Cấu hình freej2me-lr-web-bridge. Đường dẫn có thể là tuyệt đối hoặc tương đối (tính từ thư mục project). Mở rộng tích hợp freej2me-web ở 2 section 'bridge' và 'perGame' bên dưới.",
 
   "javaPath": "../jdk8u492-b09-jre/bin/java.exe",
   "freej2meJar": "../freej2me-plus",
   "defaultGameJar": null,
-
   "width": 240,
   "height": 320,
   "phoneType": 0,
   "rotate": 0,
   "fps": 60,
   "sound": 1,
-
   "maxFps": 30,
-  "port": 3000
+  "port": 3000,
+
+  "comment-bridge": "=== MỞ RỘNG TÍCH HỢP freej2me-web (CheerpJ) === Ấn game trên freej2me-web → chạy thẳng vào Node.js bridge (game WASM CheerpJ vẫn hoạt động bình thường).",
+
+  "bridge": {
+    "comment": "Bật/tắt toàn bộ bridge. Nếu false, server.js sẽ KHÔNG mount /bridge/* routes.",
+    "enabled": true,
+
+    "comment-publicUrl": "URL public của Node.js bridge mà freej2me-web sẽ gọi tới. Để trống = tự detect từ request Host header.",
+    "publicUrl": "",
+
+    "comment-shared-secret": "Shared secret giữa freej2me-web client và Node.js bridge. KHÔNG bắt buộc nhưng NÊN có cho production.",
+    "sharedSecret": "",
+
+    "comment-protocol": "Giao thức stream frames: 'ws' (HTTP) hoặc 'wss' (HTTPS). Thường tự detect từ request.",
+    "protocol": "ws",
+
+    "comment-auto-fallback": "Tự redirect sang bridge khi game CheerpJ bị lỗi (vd: M3G 3D fail). Có thể tắt để chỉ manual button.",
+    "autoFallbackOnCheerpjCrash": false,
+
+    "comment-php-api": "Endpoint kiểu PHP API (vd: /bridge/api?action=login). Response envelope { success, data, error } để web hosting phpMyAdmin tương thích.",
+    "phpApiEnabled": true,
+    "phpApiPath": "/bridge/api",
+
+    "comment-cors": "Origin cho phép gọi bridge từ freej2me-web (vd: ['https://zb3.github.io'] hoặc ['https://yourdomain.com']). Để trống = không CORS.",
+    "corsOrigins": [],
+
+    "comment-stream-opts": "Stream options cho bridge (override được qua perGame).",
+    "streamScale": 1,
+    "videoCodec": "",
+    "imageQuality": 65,
+    "audioCodec": "opus",
+
+    "comment-storage": "Thư mục lưu JAR đẩy từ freej2me-web và auto-cleanup.",
+    "gamesDir": "./freej2me_data/bridge_games",
+    "keepUploadsDays": 30,
+
+    "comment-mysql": "OPTIONAL MySQL store. Tự tạo 3 table: bridge_games, bridge_configs, bridge_sessions. Nếu enabled=false hoặc mysql2 chưa cài thì fallback JSON.",
+    "mysql": {
+      "enabled": false,
+      "host": "localhost",
+      "port": 3306,
+      "user": "freej2me_user",
+      "password": "",
+      "database": "freej2me_bridge",
+      "charset": "utf8mb4"
+    },
+
+    "comment-php-compat": "Tương thích PHP web hosting (cookie PHPSESSID, response envelope).",
+    "phpCompat": {
+      "enabled": true,
+      "acceptPhpSessionCookie": true,
+      "phpSessionCookieName": "PHPSESSID",
+      "responseEnvelope": "php"
+    }
+  },
+
+  "comment-per-game": "=== CONFIG RIÊNG CHO TỪNG GAME ===",
+  "comment-per-game-2": "Key = appId của freej2me-web (vd: 'mytetris'). Khi game được đẩy sang bridge, Node.js sẽ merge config này với settings từ CheerpJ (ưu tiên: client > perGame > defaults).",
+  "comment-per-game-3": "Mỗi appId có thể đặt: width, height, phoneType, fps, sound, rotate, maxFps, streamScale, videoCodec, imageQuality, jvmArgs.",
+
+  "perGame": {
+    "_comment_example": "Ví dụ - xoá key này khi dùng thật. Sau đó thêm key cho từng gameId của bạn.",
+    "_example_": {
+      "_comment": "Ví dụ - xoá _example_ này và thay bằng gameId thật.",
+      "width": 240,
+      "height": 320,
+      "phoneType": 1,
+      "fps": 60,
+      "sound": 1,
+      "rotate": 0,
+      "maxFps": 60,
+      "streamScale": 1,
+      "videoCodec": "rgba",
+      "imageQuality": 90,
+      "_comment_jvm": "JVM args bổ sung (vd: tăng heap).",
+      "jvmArgs": ["-Xmx256m"]
+    }
+  },
+
+  "comment-tips": "=== TIPS ===",
+  "comment-tips-2": "1. Upload game qua UI server.js (port 3000) - đây là flow chính.",
+  "comment-tips-3": "2. Hoặc: chạy tools/integrate-freej2me-web.js để patch freej2me-web, thêm nút Bridge.",
+  "comment-tips-4": "3. config.json được load 1 lần khi khởi động. Sửa và restart server.js để áp dụng.",
+  "comment-tips-5": "4. perGame[_example_] chỉ là placeholder - xoá trước khi dùng production."
 }
