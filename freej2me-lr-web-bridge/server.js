@@ -183,9 +183,9 @@ function loadConfig() {
       targetFps: 30,
       maxFps: 30,
       streamScale: 1,
-      imageQuality: 80,
-      videoCodec: 'rgb565',
-      webpQuality: 55,
+      imageQuality: 100,
+      videoCodec: 'webp',
+      webpQuality: 100,
       audioPacketMs: 40,
       audioStartBufferMs: 110,
       audioMinBufferMs: 70,
@@ -198,9 +198,9 @@ function loadConfig() {
       targetFps: 30,
       maxFps: 24,
       streamScale: 1,
-      imageQuality: 65,
-      videoCodec: 'rgb565',
-      webpQuality: 52,
+      imageQuality: 90,
+      videoCodec: 'webp',
+      webpQuality: 90,
       audioPacketMs: 50,
       audioStartBufferMs: 140,
       audioMinBufferMs: 90,
@@ -213,9 +213,9 @@ function loadConfig() {
       targetFps: 30,
       maxFps: 20,
       streamScale: 1,
-      imageQuality: 55,
+      imageQuality: 80,
       videoCodec: 'webp',
-      webpQuality: 48,
+      webpQuality: 80,
       audioPacketMs: 60,
       audioStartBufferMs: 180,
       audioMinBufferMs: 120,
@@ -339,35 +339,27 @@ function probeFfmpegAvailability() {
 function buildAdaptiveProfiles() {
   const count = CONFIG.adaptiveLevels;
   const profiles = [];
+  const webpSupported = !!sharp;
   for (let i = 0; i < count; i++) {
     const t = count <= 1 ? 0 : (i / (count - 1));
-    let videoCodec;
-    if (t < 0.28) videoCodec = 'rgba';
-    else if (t < 0.58) videoCodec = 'rgb565';
-    else if (t < 0.82) videoCodec = 'rgb332';
-    else videoCodec = 'webp';
-    if (videoCodec === 'webp' && !sharp) videoCodec = 'rgb332';
-    const streamScale = t < 0.72 ? 1 : (t < 0.92 ? 2 : 3);
-    const maxFps = clampNumber(Math.round(lerp(Math.max(24, CONFIG.maxFps), 8, t)), 8, 60);
-    const imageQuality = clampNumber(Math.round(lerp(100, 18, t)), 1, 100);
-    const webpQuality = clampNumber(Math.round(lerp(86, 28, t)), 1, 100);
-    const audioCodec = (FFMPEG_PROBE.available && t >= 0.75) ? 'opus' : 'pcm';
-    const opusKbps = clampNumber(Math.round(lerp(96, 24, t) / 4) * 4, 24, 128);
-    const audioPacketMs = clampNumber(Math.round(lerp(24, 90, t) / 2) * 2, 10, 120);
-    const audioStartBufferMs = clampNumber(Math.round(lerp(70, 260, t)), 40, 500);
-    const clientAudioMinBufferMs = clampNumber(Math.round(lerp(50, 180, t)), 40, 500);
-    const clientAudioMaxBufferMs = clampNumber(Math.round(lerp(140, 520, t)), clientAudioMinBufferMs, 1000);
-    const maxWsBufferedAmount = clampNumber(Math.round(lerp(1536 * 1024, 256 * 1024, t)), 128 * 1024, 2 * 1024 * 1024);
+    const quality = clampNumber(100 - i, 1, 100);
+    const maxFps = clampNumber(Math.round(lerp(Math.max(24, CONFIG.maxFps), 14, t)), 14, 60);
+    const audioPacketMs = clampNumber(Math.round(lerp(24, 72, t) / 2) * 2, 10, 120);
+    const audioStartBufferMs = clampNumber(Math.round(lerp(70, 220, t)), 40, 500);
+    const clientAudioMinBufferMs = clampNumber(Math.round(lerp(50, 150, t)), 40, 500);
+    const clientAudioMaxBufferMs = clampNumber(Math.round(lerp(140, 420, t)), clientAudioMinBufferMs, 1000);
+    const maxWsBufferedAmount = clampNumber(Math.round(lerp(1536 * 1024, 320 * 1024, t)), 128 * 1024, 2 * 1024 * 1024);
+    const opusKbps = clampNumber(Math.round(lerp(96, 32, t) / 4) * 4, 32, 128);
     profiles.push({
       level: i,
-      label: `L${i + 1}`,
+      label: `Q${quality}`,
       severity: t,
-      videoCodec,
-      imageQuality,
-      webpQuality,
-      streamScale,
+      videoCodec: webpSupported ? 'webp' : 'rgb565',
+      imageQuality: quality,
+      webpQuality: quality,
+      streamScale: 1,
       maxFps,
-      audioCodec,
+      audioCodec: FFMPEG_PROBE.available ? 'opus' : 'pcm',
       opusBitrate: `${opusKbps}k`,
       audioPacketMs,
       audioStartBufferMs,

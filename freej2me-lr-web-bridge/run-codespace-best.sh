@@ -54,8 +54,8 @@ if [ "$TRANSPORT_PROFILE" = "remote" ]; then
   export CLIENT_AUDIO_MAX_BUFFER_MS=${CLIENT_AUDIO_MAX_BUFFER_MS:-420}
   export OPUS_BITRATE=${OPUS_BITRATE:-64k}
 else
-  # localhost / LAN same-machine: ưu tiên giảm CPU decode + giữ audio ổn định
-  export VIDEO_CODEC=${VIDEO_CODEC:-rgb565}
+  # localhost / LAN same-machine: mặc định webp + opus, adaptive ladder sẽ giảm Q dần
+  export VIDEO_CODEC=${VIDEO_CODEC:-webp}
   export STREAM_SCALE=${STREAM_SCALE:-1}
   export MAX_FPS=${MAX_FPS:-30}
   export AUDIO_PACKET_MS=${AUDIO_PACKET_MS:-40}

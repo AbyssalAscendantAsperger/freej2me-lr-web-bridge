@@ -63,9 +63,9 @@ if /I "%TRANSPORT_PROFILE%"=="remote" (
   set OPUS_BITRATE=%OPUS_BITRATE%
   if "%OPUS_BITRATE%"=="" set OPUS_BITRATE=64k
 ) else (
-  REM localhost / LAN same-machine: ưu tiên audio ổn định và CPU nhẹ
+  REM localhost / LAN same-machine: mặc định webp + opus, adaptive ladder sẽ giảm Q dần
   set VIDEO_CODEC=%VIDEO_CODEC%
-  if "%VIDEO_CODEC%"=="" set VIDEO_CODEC=rgb565
+  if "%VIDEO_CODEC%"=="" set VIDEO_CODEC=webp
   set STREAM_SCALE=%STREAM_SCALE%
   if "%STREAM_SCALE%"=="" set STREAM_SCALE=1
   set MAX_FPS=%MAX_FPS%
