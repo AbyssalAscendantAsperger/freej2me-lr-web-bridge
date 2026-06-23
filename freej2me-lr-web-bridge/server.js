@@ -914,6 +914,7 @@ class EmulatorSession {
     this.backendReconnectTimer = null;
     this.frameRequestTimer = null;
     this.closing = false;
+    this.clientForcedAudioMode = null;
     this.desiredEncoding = 'ISO_8859_1';
     this.emuFrameWidth = CONFIG.width; this.emuFrameHeight = CONFIG.height;
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
@@ -1036,6 +1037,45 @@ class EmulatorSession {
 
   broadcast(data, opts = {}) { for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data, opts); }
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
+  shouldUseOpus() { return !!(this.opusAudioEnabled && this.clientForcedAudioMode !== 'pcm' && FFMPEG_PROBE.available); }
+  getAdvertisedAudioCodec() { return this.shouldUseOpus() ? 'opus' : 'pcm'; }
+  getCurrentAudioUrl() { return this.shouldUseOpus() ? `/audio/${this.publicId}.webm` : null; }
+  makeAudioFormatPacketFromCurrent() {
+    if (!this.currentAudioFormat) return null;
+    const packet = Buffer.allocUnsafe(13);
+    packet.write('FJ2A', 0, 4, 'ascii');
+    packet[4] = 1;
+    packet.writeUInt32BE(this.currentAudioFormat.sampleRate || 44100, 5);
+    packet[9] = this.currentAudioFormat.channels || 1;
+    packet[10] = this.currentAudioFormat.bits || 16;
+    packet[11] = this.currentAudioFormat.signed ? 1 : 0;
+    packet[12] = this.currentAudioFormat.bigEndian ? 1 : 0;
+    return packet;
+  }
+  setClientAudioMode(mode = 'auto', reason = 'client') {
+    const normalized = String(mode || 'auto').toLowerCase() === 'pcm' ? 'pcm' : null;
+    const before = this.getAdvertisedAudioCodec();
+    this.clientForcedAudioMode = normalized;
+    const after = this.getAdvertisedAudioCodec();
+    if (before === after) return;
+    if (after === 'opus') {
+      if (this.currentAudioFormat) this.startOpusEncoder();
+    } else {
+      this.stopOpusEncoder();
+      const fmt = this.makeAudioFormatPacketFromCurrent();
+      if (fmt) this.broadcast(fmt, { binary: true, compress: false });
+    }
+    this.broadcastJson(this.getAudioStatus({ event: 'audio-mode', reason, audioCodec: after, audioUrl: this.getCurrentAudioUrl() }));
+  }
+  debugAdaptiveDrop(amount, reason = 'debug-drop') {
+    const delta = Math.max(1, Math.abs(amount | 0));
+    this.videoStats.stableWindows = 0;
+    this.applyAdaptiveProfile(this.profileLevel + delta, `${reason}+${delta}`);
+  }
+  debugAdaptiveReset(reason = 'debug-reset') {
+    this.videoStats.stableWindows = 0;
+    this.applyAdaptiveProfile(0, reason);
+  }
   getClientAudioTuning() {
     const p = this.getCurrentProfile();
     return {
@@ -1045,7 +1085,7 @@ class EmulatorSession {
       audioStartBufferMs: p.audioStartBufferMs,
       clientAudioMinBufferMs: p.clientAudioMinBufferMs,
       clientAudioMaxBufferMs: p.clientAudioMaxBufferMs,
-      audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm',
+      audioCodec: this.getAdvertisedAudioCodec(),
       adaptiveLevel: this.profileLevel,
       adaptiveCount: ADAPTIVE_PROFILES.length,
     };
@@ -1108,7 +1148,7 @@ class EmulatorSession {
     ws._emuSession = this;
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
     const p = this.getCurrentProfile();
-    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null, audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm' }));
+    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.getCurrentAudioUrl(), audioCodec: this.getAdvertisedAudioCodec() }));
     ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
     ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ffmpegAvailable: FFMPEG_PROBE.available, ...this.getClientAudioTuning() }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
@@ -1197,7 +1237,7 @@ class EmulatorSession {
 
   startOpusEncoder() {
     const p = this.getCurrentProfile();
-    if (!FFMPEG_PROBE.available || !this.opusAudioEnabled || !this.currentAudioFormat || this.ffmpeg) return;
+    if (!FFMPEG_PROBE.available || !this.shouldUseOpus() || !this.currentAudioFormat || this.ffmpeg) return;
     const f = this.currentAudioFormat;
     if (f.bits !== 16 || !f.signed) {
       console.warn(`[AUDIO ${this.username}] Opus fallback: unsupported PCM format`, f);
@@ -1251,7 +1291,7 @@ class EmulatorSession {
   }
 
   writeOpusPcm(payload) {
-    if (!this.opusAudioEnabled) return false;
+    if (!this.shouldUseOpus()) return false;
     this.startOpusEncoder();
     if (!this.ffmpeg || !this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed) return false;
     try { this.ffmpeg.stdin.write(payload); return true; }
@@ -1259,7 +1299,7 @@ class EmulatorSession {
   }
 
   addAudioHttpClient(res) {
-    if (!this.opusAudioEnabled) return false;
+    if (!this.shouldUseOpus()) return false;
     res.writeHead(200, {
       'Content-Type': 'audio/webm; codecs=opus',
       'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
@@ -1503,9 +1543,9 @@ class EmulatorSession {
       this.stopOpusEncoder();
       this.opusAudioEnabled = !!(this.getCurrentProfile().audioCodec === 'opus' && FFMPEG_PROBE.available);
       console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
-      if (!this.opusAudioEnabled) this.broadcast(packet, { binary: true, compress: false });
-      this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.opusAudioEnabled ? 'opus' : 'pcm', audioUrl: this.opusAudioEnabled ? `/audio/${this.publicId}.webm` : null }));
-      if (this.opusAudioEnabled) this.startOpusEncoder();
+      if (!this.shouldUseOpus()) this.broadcast(packet, { binary: true, compress: false });
+      this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.getAdvertisedAudioCodec(), audioUrl: this.getCurrentAudioUrl() }));
+      if (this.shouldUseOpus()) this.startOpusEncoder();
       return;
     }
     if (type === 2) {
@@ -1514,7 +1554,7 @@ class EmulatorSession {
       if (len > 1024 * 1024 || 9 + len > packet.length) return;
       const payload = Buffer.from(packet.slice(9, 9 + len));
       this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.opusAudioEnabled ? 'opus' : 'pcm'}, coalesce=${this.getCurrentProfile().audioPacketMs}ms`);
+      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.getAdvertisedAudioCodec()}, coalesce=${this.getCurrentProfile().audioPacketMs}ms`);
       if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
     }
   }
@@ -1728,7 +1768,7 @@ function getPatchedIndexHtml() {
     </div>
     <div class="v16-hint">Mỗi tài khoản có save riêng theo từng game. Bạn có thể upload JAR sau khi đăng nhập.</div>
   </div>`;
-  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <div id="adaptive-debug" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:12px;background:#18222d;color:#cfe3ff;font:12px/1.4 monospace"></div>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
+  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <div id="adaptive-debug" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:12px;background:#18222d;color:#cfe3ff;font:12px/1.4 monospace"></div>\n  <div id="adaptive-buttons" style="display:none;gap:6px;flex-wrap:wrap;margin:0 0 10px"></div>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
 
   const patchedKeyMap = `const keyMap = {
       'w': 0, 'W': 0, 's': 1, 'S': 1, 'a': 2, 'A': 2, 'd': 3, 'D': 3,
@@ -1753,6 +1793,7 @@ function getPatchedIndexHtml() {
     const btnLogout = document.getElementById('btn-logout');
     const audioToggle = document.getElementById('audio-toggle');
     const adaptiveDebugEl = document.getElementById('adaptive-debug');
+    const adaptiveButtonsEl = document.getElementById('adaptive-buttons');
     const controlsEl = document.getElementById('controls');
     const uploadAreaEl = document.getElementById('upload-area');
     const screenContainerEl = document.getElementById('screen-container');
@@ -1788,6 +1829,7 @@ function getPatchedIndexHtml() {
       if (helpEl) helpEl.style.display = show ? '' : 'none';
       if (audioToggle) audioToggle.style.display = show ? '' : 'none';
       if (adaptiveDebugEl) adaptiveDebugEl.style.display = show ? '' : 'none';
+      if (adaptiveButtonsEl) adaptiveButtonsEl.style.display = show ? 'flex' : 'none';
       if (loginUser) loginUser.style.display = show ? 'none' : '';
       if (loginPass) loginPass.style.display = show ? 'none' : '';
       if (btnLogin) btnLogin.style.display = show ? 'none' : '';
@@ -1831,6 +1873,33 @@ function getPatchedIndexHtml() {
     let audioUnderruns = 0, audioStablePackets = 0, audioDroppedPackets = 0;
     function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
     function setAudioButton(t, title) { if(audioToggle){ audioToggle.textContent=t; if(title) audioToggle.title=title; } }
+    function sendDebugAdaptive(mode, amount){ if(!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type:'debugAdaptive', mode, amount })); }
+    function sendAudioMode(mode, reason){ if(!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type:'audioMode', mode, reason })); }
+    if(adaptiveButtonsEl){
+      const defs = [10,20,30,50,100];
+      defs.forEach((n) => {
+        const btn = document.createElement('button');
+        btn.textContent = 'Drop +' + n;
+        btn.style.cssText = 'padding:6px 10px;border:0;border-radius:10px;background:#5a2b2b;color:#fff;cursor:pointer';
+        btn.onclick = () => sendDebugAdaptive('drop', n);
+        adaptiveButtonsEl.appendChild(btn);
+      });
+      const resetBtn = document.createElement('button');
+      resetBtn.textContent = 'Reset level';
+      resetBtn.style.cssText = 'padding:6px 10px;border:0;border-radius:10px;background:#245a2b;color:#fff;cursor:pointer';
+      resetBtn.onclick = () => sendDebugAdaptive('reset', 0);
+      adaptiveButtonsEl.appendChild(resetBtn);
+      const pcmBtn = document.createElement('button');
+      pcmBtn.textContent = 'Force PCM';
+      pcmBtn.style.cssText = 'padding:6px 10px;border:0;border-radius:10px;background:#23485a;color:#fff;cursor:pointer';
+      pcmBtn.onclick = () => sendAudioMode('pcm', 'debug-force-pcm');
+      adaptiveButtonsEl.appendChild(pcmBtn);
+      const autoBtn = document.createElement('button');
+      autoBtn.textContent = 'Audio Auto';
+      autoBtn.style.cssText = 'padding:6px 10px;border:0;border-radius:10px;background:#3a3a5a;color:#fff;cursor:pointer';
+      autoBtn.onclick = () => sendAudioMode('auto', 'debug-audio-auto');
+      adaptiveButtonsEl.appendChild(autoBtn);
+    }
     function ensureAudioContext(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'playback'}); return audioCtx; }
     function browserTestBeep(){ try{ const ctx=ensureAudioContext(); const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(0.001,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.015); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.16); o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.18);}catch(e){} }
     function applyAudioTuning(msg){
@@ -1848,7 +1917,18 @@ function getPatchedIndexHtml() {
       audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec);
     }
     function resetAudioScheduler(){ if(audioCtx) audioNextTime = audioCtx.currentTime + audioTargetBufferSec; }
-    function stopOpusAudio(){ if(opusAudioEl){ try{ opusAudioEl.pause(); }catch(e){} try{ opusAudioEl.removeAttribute('src'); opusAudioEl.load(); }catch(e){} } }
+    let opusProbeTimer = null, opusPlayingConfirmed = false;
+    function clearOpusProbe(){ if(opusProbeTimer){ clearTimeout(opusProbeTimer); opusProbeTimer = null; } }
+    function requestPcmFallback(reason){ if(audioCodecMode !== 'opus') return; console.warn('Opus fallback -> PCM:', reason); audioCodecMode = 'pcm'; opusAudioUrl = null; stopOpusAudio(); sendAudioMode('pcm', reason); refreshAudioButtonTitle('fallback-pcm ' + reason); }
+    function attachOpusEvents(){
+      if(!opusAudioEl || opusAudioEl._fj2meEventsAttached) return;
+      opusAudioEl._fj2meEventsAttached = true;
+      const good = () => { opusPlayingConfirmed = true; clearOpusProbe(); refreshAudioButtonTitle('opus-playing'); };
+      const bad = (ev) => { if(audioCodecMode === 'opus') requestPcmFallback('opus-' + ev.type); };
+      ['playing','canplay','timeupdate'].forEach(name => opusAudioEl.addEventListener(name, good));
+      ['error','stalled','abort','emptied'].forEach(name => opusAudioEl.addEventListener(name, bad));
+    }
+    function stopOpusAudio(){ clearOpusProbe(); opusPlayingConfirmed = false; if(opusAudioEl){ try{ opusAudioEl.pause(); }catch(e){} try{ opusAudioEl.removeAttribute('src'); opusAudioEl.load(); }catch(e){} } }
     function updateAdaptiveDebug(extra){
       if(!adaptiveDebugEl) return;
       const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
@@ -1861,7 +1941,7 @@ function getPatchedIndexHtml() {
       setAudioButton(state, title);
       updateAdaptiveDebug(extra || 'ready');
     }
-    function startOpusAudio(){ if(!opusAudioUrl || audioCodecMode !== 'opus') return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); refreshAudioButtonTitle(); }
+    function startOpusAudio(){ if(!opusAudioUrl || audioCodecMode !== 'opus') return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } attachOpusEvents(); const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusPlayingConfirmed = false; clearOpusProbe(); opusProbeTimer = setTimeout(() => { if(audioCodecMode === 'opus' && !opusPlayingConfirmed) requestPcmFallback('opus-timeout'); }, 2500); opusAudioEl.play().catch(e=>{ console.warn('Opus audio play blocked:', e); requestPcmFallback('opus-play'); }); refreshAudioButtonTitle(); }
     function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); }
     audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); } refreshAudioButtonTitle(); } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
@@ -1992,7 +2072,7 @@ function getPatchedIndexHtml() {
       return tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable;
     }
   `;
-  html = html.replace('    const pressedKeys = new Set();', inputGuard + '\n    canvas.setAttribute("tabindex", "0");\n    canvas.style.outline = "none";\n    canvas.addEventListener("mousedown", () => { try { canvas.focus(); } catch(e) {} });\n    canvas.addEventListener("touchstart", () => { try { canvas.focus(); } catch(e) {} }, { passive: false });\n    document.addEventListener("keydown", (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); try { canvas.focus(); } catch(err) {} }, true);\n    document.addEventListener("keyup", (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); }, true);\n    const pressedKeys = new Set();');
+  html = html.replace('    const pressedKeys = new Set();', inputGuard + '\n    canvas.setAttribute("tabindex", "0");\n    canvas.style.outline = "none";\n    canvas.addEventListener("mousedown", () => { try { canvas.focus(); } catch(e) {} });\n    canvas.addEventListener("touchstart", () => { try { canvas.focus(); } catch(e) {} }, { passive: false });\n    const swallowGameKey = (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); try { canvas.focus(); } catch(err) {} };\n    document.addEventListener("keydown", swallowGameKey, true);\n    document.addEventListener("keypress", swallowGameKey, true);\n    document.addEventListener("keyup", (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); }, true);\n    const pressedKeys = new Set();');
   html = html.replace(
     "window.addEventListener('keydown', (e) => {\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];",
     "window.addEventListener('keydown', (e) => {\n      if (isTypingTarget(e)) return;\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];"
@@ -2060,7 +2140,7 @@ function startWebServer() {
 
   app.get('/audio/:id.webm', (req, res) => {
     const sess = publicSessionIds.get(req.params.id);
-    if (!sess || !sess.isRunning || !sess.opusAudioEnabled) {
+    if (!sess || !sess.isRunning || !sess.shouldUseOpus()) {
       res.status(404).end('audio stream not found');
       return;
     }
@@ -2096,6 +2176,11 @@ function startWebServer() {
         if (data.type === 'key' || data.type === 'touch') s.markInputActivity();
         if (data.type === 'key') { if (data.state === 'D') s.sendKeyDown(data.key); else if (data.state === 'U') s.sendKeyUp(data.key); }
         else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) { const scale = Math.max(1, ((s.getCurrentProfile ? s.getCurrentProfile().streamScale : CONFIG.streamScale) || 1) | 0); const x = data.x < 0 ? data.x : Math.max(0, Math.min(s.emuFrameWidth - 1, Math.floor(data.x * scale))); const y = data.y < 0 ? data.y : Math.max(0, Math.min(s.emuFrameHeight - 1, Math.floor(data.y * scale))); s.sendMouse(cmd, x, y); } }
+        else if (data.type === 'audioMode') { s.setClientAudioMode(data.mode, data.reason || 'client'); }
+        else if (data.type === 'debugAdaptive') {
+          if (String(data.mode || '') === 'reset') s.debugAdaptiveReset('debug-reset');
+          else s.debugAdaptiveDrop(parseInt(data.amount || 1, 10) || 1, 'debug-drop');
+        }
       } catch (e) { console.error('[WS]', e.message); }
     });
   });
