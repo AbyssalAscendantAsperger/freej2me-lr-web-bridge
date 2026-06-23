@@ -351,7 +351,7 @@ function buildAdaptiveProfiles() {
     const maxFps = clampNumber(Math.round(lerp(Math.max(24, CONFIG.maxFps), 8, t)), 8, 60);
     const imageQuality = clampNumber(Math.round(lerp(100, 18, t)), 1, 100);
     const webpQuality = clampNumber(Math.round(lerp(86, 28, t)), 1, 100);
-    const audioCodec = (FFMPEG_PROBE.available && t >= 0.34) ? 'opus' : 'pcm';
+    const audioCodec = (FFMPEG_PROBE.available && t >= 0.75) ? 'opus' : 'pcm';
     const opusKbps = clampNumber(Math.round(lerp(96, 24, t) / 4) * 4, 24, 128);
     const audioPacketMs = clampNumber(Math.round(lerp(24, 90, t) / 2) * 2, 10, 120);
     const audioStartBufferMs = clampNumber(Math.round(lerp(70, 260, t)), 40, 500);
@@ -924,6 +924,8 @@ class EmulatorSession {
     this.audioPcmBytes = 0;
     this.audioFlushTimer = null;
     this.lastActivity = now();
+    this.lastVisualProfileChangeAt = 0;
+    this.visualProfile = null;
     this.dataDir = path.join(CONFIG.dataDir, 'users', safeName(this.userId), 'games', gameHash, 'runtime');
     ensureDir(this.dataDir);
     this.applyAdaptiveProfile(0, 'init');
@@ -931,21 +933,50 @@ class EmulatorSession {
 
   touch() { this.lastActivity = now(); }
   getCurrentProfile() { return this.profile || ADAPTIVE_PROFILES[0]; }
+  maybeApplyVisualProfile(targetProfile, reason) {
+    const nowTs = now();
+    if (!this.visualProfile) {
+      this.visualProfile = { videoCodec: targetProfile.videoCodec, streamScale: targetProfile.streamScale };
+      this.lastVisualProfileChangeAt = nowTs;
+      return true;
+    }
+    const currentKey = `${this.visualProfile.videoCodec}:${this.visualProfile.streamScale}`;
+    const targetKey = `${targetProfile.videoCodec}:${targetProfile.streamScale}`;
+    if (currentKey === targetKey) return false;
+    const targetRank = targetProfile.severity;
+    const currentRank = (this.profile && typeof this.profile.severity === 'number') ? this.profile.severity : 0;
+    const isDegradeVisual = targetRank > currentRank;
+    if (isDegradeVisual) {
+      this.visualProfile = { videoCodec: targetProfile.videoCodec, streamScale: targetProfile.streamScale };
+      this.lastVisualProfileChangeAt = nowTs;
+      return true;
+    }
+    const holdMs = 5000;
+    const enoughStable = this.videoStats.stableWindows >= Math.max(CONFIG.adaptiveRecoverWindows * 3, 6);
+    if (nowTs - this.lastVisualProfileChangeAt >= holdMs && enoughStable) {
+      this.visualProfile = { videoCodec: targetProfile.videoCodec, streamScale: targetProfile.streamScale };
+      this.lastVisualProfileChangeAt = nowTs;
+      return true;
+    }
+    return false;
+  }
   applyAdaptiveProfile(level, reason = 'manual') {
     const max = ADAPTIVE_PROFILES.length - 1;
     const nextLevel = clampNumber(level, 0, max);
     const prevProfile = this.profile;
+    const target = ADAPTIVE_PROFILES[nextLevel] || ADAPTIVE_PROFILES[0];
     this.profileLevel = nextLevel;
-    this.profile = ADAPTIVE_PROFILES[nextLevel] || ADAPTIVE_PROFILES[0];
+    const visualChanged = this.maybeApplyVisualProfile(target, reason);
+    this.profile = Object.assign({}, target, this.visualProfile ? { videoCodec: this.visualProfile.videoCodec, streamScale: this.visualProfile.streamScale } : {});
     this.opusAudioEnabled = !!(this.profile && this.profile.audioCodec === 'opus' && FFMPEG_PROBE.available);
     if (!this.opusAudioEnabled) this.stopOpusEncoder();
     else if (this.currentAudioFormat) this.startOpusEncoder();
     if (this.isRunning) this.startFramePump();
-    if (!prevProfile || prevProfile.level !== this.profile.level || reason !== 'init') {
-      console.log(`[ADAPT ${this.username}] ${reason} -> level=${this.profile.level + 1}/${ADAPTIVE_PROFILES.length} codec=${this.profile.videoCodec} scale=${this.profile.streamScale} fps=${this.profile.maxFps} audio=${this.profile.audioCodec}${this.opusAudioEnabled ? ':' + this.profile.opusBitrate : ''}`);
+    if (!prevProfile || prevProfile.level !== target.level || reason !== 'init' || visualChanged) {
+      console.log(`[ADAPT ${this.username}] ${reason} -> level=${target.level + 1}/${ADAPTIVE_PROFILES.length} video=${this.profile.videoCodec}@${this.profile.streamScale} targetVideo=${target.videoCodec}@${target.streamScale} fps=${this.profile.maxFps} audio=${this.profile.audioCodec}${this.opusAudioEnabled ? ':' + this.profile.opusBitrate : ''}`);
       if (this.clients.size > 0) {
         this.broadcastConfig();
-        this.broadcastJson(this.getAudioStatus({ event: 'adaptive-profile', adaptiveLevel: this.profile.level, adaptiveCount: ADAPTIVE_PROFILES.length }));
+        this.broadcastJson(this.getAudioStatus({ event: 'adaptive-profile', adaptiveLevel: target.level, adaptiveCount: ADAPTIVE_PROFILES.length, visualChanged, videoCodec: this.profile.videoCodec, streamScale: this.profile.streamScale }));
       }
     }
   }
@@ -1652,6 +1683,27 @@ function getPatchedIndexHtml() {
       border:1px solid rgba(255,255,255,.10);
       box-shadow:0 10px 36px rgba(0,0,0,.25);
     }
+    body.v16-game-active #screen-container {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      background: #000 !important;
+      z-index: 50 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    body.v16-game-active #canvas {
+      width: auto !important;
+      height: auto !important;
+      max-width: 100vw !important;
+      max-height: 100vh !important;
+      outline: none !important;
+      image-rendering: pixelated;
+    }
     @media (max-width:560px) { .v16-row { grid-template-columns:1fr; } #login-box.v16-card{padding:16px;} }
   </style>
   <div id="login-box" class="v16-card">
@@ -1723,8 +1775,10 @@ function getPatchedIndexHtml() {
     }
     function setGameUiVisible(show) {
       gameLoaded = !!show;
+      document.body.classList.toggle('v16-game-active', !!show);
       if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
       if (controlsEl) controlsEl.style.display = show ? 'grid' : 'none';
+      if (show) { try { canvas.focus(); } catch(e) {} }
     }
     function setLoggedInUi(show) {
       document.body.classList.toggle('v16-login-mode', !show);
@@ -1938,7 +1992,7 @@ function getPatchedIndexHtml() {
       return tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable;
     }
   `;
-  html = html.replace('    const pressedKeys = new Set();', inputGuard + '\n    const pressedKeys = new Set();');
+  html = html.replace('    const pressedKeys = new Set();', inputGuard + '\n    canvas.setAttribute("tabindex", "0");\n    canvas.style.outline = "none";\n    canvas.addEventListener("mousedown", () => { try { canvas.focus(); } catch(e) {} });\n    canvas.addEventListener("touchstart", () => { try { canvas.focus(); } catch(e) {} }, { passive: false });\n    document.addEventListener("keydown", (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); try { canvas.focus(); } catch(err) {} }, true);\n    document.addEventListener("keyup", (e) => { if (!gameLoaded || isTypingTarget(e)) return; const keyIndex = keyMap[e.key] ?? keyMap[e.code]; if (keyIndex === undefined) return; e.preventDefault(); e.stopPropagation(); }, true);\n    const pressedKeys = new Set();');
   html = html.replace(
     "window.addEventListener('keydown', (e) => {\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];",
     "window.addEventListener('keydown', (e) => {\n      if (isTypingTarget(e)) return;\n      const keyIndex = keyMap[e.key] ?? keyMap[e.code];"
