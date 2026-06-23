@@ -324,6 +324,7 @@ let wss = null;
 let javaBackend = null;
 const emulatorSessions = new Map(); // key userId:gameHash -> EmulatorSession
 const publicSessionIds = new Map(); // publicId -> EmulatorSession for /audio/:id.webm
+const userSessionLocks = new Map();
 
 // =================== UTILS ===================
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
@@ -372,6 +373,20 @@ function countOpenWsForIp(ip) {
   let n = 0;
   wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN && ws._ip === ip) n++; });
   return n;
+}
+async function withUserSessionLock(userId, task) {
+  const key = String(userId || '');
+  const prev = userSessionLocks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const chain = prev.then(() => gate);
+  userSessionLocks.set(key, chain);
+  await prev;
+  try { return await task(); }
+  finally {
+    release();
+    if (userSessionLocks.get(key) === chain) userSessionLocks.delete(key);
+  }
 }
 function closeUserSockets(userId, reason = 'session_invalidated') {
   if (!wss) return;
@@ -1417,16 +1432,15 @@ function detachClientFromOtherSessions(ws, keepSession) {
   }
 }
 
-function stopOtherSessionsForUser(userId, keepKey = null) {
+async function stopOtherSessionsForUser(userId, keepKey = null) {
   for (const [key, sess] of Array.from(emulatorSessions.entries())) {
     if (sess.userId === userId && key !== keepKey) {
       console.log(`[SESSION] stop old session user=${sess.username} game=${sess.gameHash}`);
-      // Detach sockets first so old emulator can no longer broadcast stale frames to web.
       for (const ws of Array.from(sess.clients)) {
         sess.clients.delete(ws);
         if (ws._emuSession === sess) ws._emuSession = null;
       }
-      sess.cleanupProcess();
+      await sess.destroySession('replace');
       emulatorSessions.delete(key);
     }
   }
@@ -1788,7 +1802,7 @@ function startWebServer() {
 
   app.get('/api/me', (req, res) => res.json({ user: db.publicUser(requireUser(req, null)) }));
   app.post('/api/register', rateLimitMiddleware('auth-register', CONFIG.authRateLimit), (req, res) => { try { const u = db.register(req.body.username, req.body.password, getIp(req)); res.json({ success: true, user: db.publicUser(u) }); } catch (e) { res.status(400).json({ error: e.message }); } });
-  app.post('/api/login', rateLimitMiddleware('auth-login', CONFIG.authRateLimit), (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); if (CONFIG.sessionPolicy === 'single') { closeUserSockets(user.id, 'logged_in_elsewhere'); stopOtherSessionsForUser(user.id); } setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user), sessionPolicy: CONFIG.sessionPolicy }); } catch (e) { res.status(401).json({ error: e.message }); } });
+  app.post('/api/login', rateLimitMiddleware('auth-login', CONFIG.authRateLimit), async (req, res) => { try { const { sid, user } = db.login(req.body.username, req.body.password); if (CONFIG.sessionPolicy === 'single') { closeUserSockets(user.id, 'logged_in_elsewhere'); await stopOtherSessionsForUser(user.id); } setCookie(res, 'fj2me_sid', sid, { maxAge: 30 * 24 * 3600 }); res.json({ success: true, user: db.publicUser(user), sessionPolicy: CONFIG.sessionPolicy }); } catch (e) { res.status(401).json({ error: e.message }); } });
   app.post('/api/logout', (req, res) => { db.logout(parseCookies(req).fj2me_sid); clearCookie(res, 'fj2me_sid'); res.json({ success: true }); });
   app.get('/api/queue', (req, res) => res.json({ success: true, queue: startQueue.status(), activeSessions: emulatorSessions.size, limits: { maxActiveSessions: CONFIG.maxActiveSessions, maxWsPerIp: CONFIG.maxWsPerIp, maxClientsPerInstance: CONFIG.maxClientsPerInstance } }));
   app.get('/api/storage', (req, res) => {
@@ -1804,31 +1818,30 @@ function startWebServer() {
     const user = requireUser(req, res); if (!user) return;
     if (!req.file) return res.status(400).json({ error: 'Không có file' });
     try {
-      enforceUserStorageQuota(user.id);
-      enforceTotalStorageQuota();
-      const jarPath = path.resolve(req.file.path);
-      const gameHash = sha1File(jarPath);
-      if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
-      // V24: Web và emulator phải gắn chặt 1-1 theo user. Khi user upload JAR mới,
-      // dừng toàn bộ emulator cũ của user trước để tránh 2 process cùng broadcast gây nhấp nháy.
-      stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
-      const sess = getOrCreateSession(user, gameHash, jarPath);
-      // Bind các socket hiện tại vào session mới trước khi start để config/loading tới đúng client.
-      if (wss) {
-        wss.clients.forEach((ws) => {
-          if (ws.readyState === WebSocket.OPEN && ws._userId === user.id) sess.addClient(ws);
-        });
-      }
-      sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
-      await sess.start();
-      // V24: bind các WebSocket đang mở của user này vào session mới.
-      // Bản V10 tạo session sau upload nhưng WebSocket cũ vẫn ở trạng thái noGame.
-      if (wss) {
-        wss.clients.forEach((ws) => {
-          if (ws.readyState === WebSocket.OPEN && ws._userId === user.id && ws._emuSession !== sess) sess.addClient(ws);
-        });
-      }
-      res.json({ success: true, gameHash, jar: req.file.filename, user: db.publicUser(user), dataDir: sess.dataDir });
+      const result = await withUserSessionLock(user.id, async () => {
+        enforceUserStorageQuota(user.id);
+        enforceTotalStorageQuota();
+        const jarPath = path.resolve(req.file.path);
+        const gameHash = sha1File(jarPath);
+        if (emulatorSessions.size >= CONFIG.maxActiveSessions && !getActiveSessionForUser(user.id)) throw new Error('Server đã đạt giới hạn session đang chạy');
+        // Serialize per-user upload/session replacement to avoid tearing down the shared backend on rapid re-upload.
+        await stopOtherSessionsForUser(user.id, `${user.id}:${gameHash}`);
+        const sess = getOrCreateSession(user, gameHash, jarPath);
+        if (wss) {
+          wss.clients.forEach((ws) => {
+            if (ws.readyState === WebSocket.OPEN && ws._userId === user.id) sess.addClient(ws);
+          });
+        }
+        sess.broadcastJson({ type: 'status', state: 'loading', gameHash });
+        await sess.start();
+        if (wss) {
+          wss.clients.forEach((ws) => {
+            if (ws.readyState === WebSocket.OPEN && ws._userId === user.id && ws._emuSession !== sess) sess.addClient(ws);
+          });
+        }
+        return { gameHash, dataDir: sess.dataDir };
+      });
+      res.json({ success: true, gameHash: result.gameHash, jar: req.file.filename, user: db.publicUser(user), dataDir: result.dataDir });
     } catch (e) { if (req.file && req.file.path) removePathSafe(req.file.path); console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
   });
 
