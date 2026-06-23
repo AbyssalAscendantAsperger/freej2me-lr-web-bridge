@@ -267,7 +267,7 @@ function loadConfig() {
     opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || profile.opusBitrate),
     ffmpegPath: process.env.FFMPEG_PATH || fileConfig.ffmpegPath || 'ffmpeg',
     adaptiveStreaming: boolConfig('ADAPTIVE_STREAMING', fileConfig.adaptiveStreaming, true),
-    adaptiveLevels: Math.max(12, Math.min(100, intConfig('ADAPTIVE_LEVELS', fileConfig.adaptiveLevels, 20))),
+    adaptiveLevels: Math.max(12, Math.min(100, intConfig('ADAPTIVE_LEVELS', fileConfig.adaptiveLevels, 100))),
     adaptiveWindowMs: Math.max(400, Math.min(5000, intConfig('ADAPTIVE_WINDOW_MS', fileConfig.adaptiveWindowMs, 1000))),
     adaptiveRecoverWindows: Math.max(2, Math.min(10, intConfig('ADAPTIVE_RECOVER_WINDOWS', fileConfig.adaptiveRecoverWindows, 3))),
     javaBackendHost: process.env.JAVA_BACKEND_HOST || fileConfig.javaBackendHost || '127.0.0.1',
@@ -1676,7 +1676,7 @@ function getPatchedIndexHtml() {
     </div>
     <div class="v16-hint">Mỗi tài khoản có save riêng theo từng game. Bạn có thể upload JAR sau khi đăng nhập.</div>
   </div>`;
-  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
+  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <div id="adaptive-debug" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:12px;background:#18222d;color:#cfe3ff;font:12px/1.4 monospace"></div>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
 
   const patchedKeyMap = `const keyMap = {
       'w': 0, 'W': 0, 's': 1, 'S': 1, 'a': 2, 'A': 2, 'd': 3, 'D': 3,
@@ -1700,6 +1700,7 @@ function getPatchedIndexHtml() {
     const btnRegister = document.getElementById('btn-register');
     const btnLogout = document.getElementById('btn-logout');
     const audioToggle = document.getElementById('audio-toggle');
+    const adaptiveDebugEl = document.getElementById('adaptive-debug');
     const controlsEl = document.getElementById('controls');
     const uploadAreaEl = document.getElementById('upload-area');
     const screenContainerEl = document.getElementById('screen-container');
@@ -1732,6 +1733,7 @@ function getPatchedIndexHtml() {
       if (screenContainerEl) screenContainerEl.style.display = show ? '' : 'none';
       if (helpEl) helpEl.style.display = show ? '' : 'none';
       if (audioToggle) audioToggle.style.display = show ? '' : 'none';
+      if (adaptiveDebugEl) adaptiveDebugEl.style.display = show ? '' : 'none';
       if (loginUser) loginUser.style.display = show ? 'none' : '';
       if (loginPass) loginPass.style.display = show ? 'none' : '';
       if (btnLogin) btnLogin.style.display = show ? 'none' : '';
@@ -1793,17 +1795,23 @@ function getPatchedIndexHtml() {
     }
     function resetAudioScheduler(){ if(audioCtx) audioNextTime = audioCtx.currentTime + audioTargetBufferSec; }
     function stopOpusAudio(){ if(opusAudioEl){ try{ opusAudioEl.pause(); }catch(e){} try{ opusAudioEl.removeAttribute('src'); opusAudioEl.load(); }catch(e){} } }
+    function updateAdaptiveDebug(extra){
+      if(!adaptiveDebugEl) return;
+      const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
+      adaptiveDebugEl.textContent = 'Adaptive level ' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' | video=' + videoCodec + ' q=' + imageQuality + ' | audio=' + codec + ' | packet=' + audioPacketMs + 'ms | drop=' + audioDroppedPackets + ' | underrun=' + audioUnderruns + (extra ? ' | ' + extra : '');
+    }
     function refreshAudioButtonTitle(extra){
       const state = audioUnlocked && !audioMuted ? '🔊 Âm thanh: bật' : '🔇 Bật âm thanh';
       const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
       const title = 'codec=' + codec + ' ffmpeg=' + (ffmpegAvailable ? 'on' : 'off') + ' profile=' + transportProfile + ' ladder=' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
       setAudioButton(state, title);
+      updateAdaptiveDebug(extra || 'ready');
     }
     function startOpusAudio(){ if(!opusAudioUrl || audioCodecMode !== 'opus') return; if(!opusAudioEl){ opusAudioEl = new Audio(); opusAudioEl.autoplay = true; opusAudioEl.controls = false; opusAudioEl.preload = 'none'; document.body.appendChild(opusAudioEl); } const u = opusAudioUrl + (opusAudioUrl.includes('?') ? '&' : '?') + 't=' + Date.now(); if(opusAudioEl.src !== location.origin + u && opusAudioEl.src !== u) opusAudioEl.src = u; opusAudioEl.muted = false; opusAudioEl.play().catch(e=>console.warn('Opus audio play blocked:', e)); refreshAudioButtonTitle(); }
     function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); }
     audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); } refreshAudioButtonTitle(); } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ applyAudioTuning(msg); if(audioCodecMode === 'opus'){ opusAudioUrl = msg.audioUrl || opusAudioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } else { opusAudioUrl = null; stopOpusAudio(); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ applyAudioTuning(msg); if(audioCodecMode === 'opus'){ opusAudioUrl = msg.audioUrl || opusAudioUrl; if(audioUnlocked && !audioMuted) startOpusAudio(); } else { opusAudioUrl = null; stopOpusAudio(); } if(msg.event === 'adaptive-profile'){ console.log('[adaptive]', msg.adaptiveLevel + 1, '/', msg.adaptiveCount, msg); setStatus('Adaptive level ' + (msg.adaptiveLevel + 1) + '/' + msg.adaptiveCount + ' | ' + videoCodec + ' | ' + audioCodecMode, 'connected'); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function handleAudioPacket(u8){
       if(!isAudioPacket(u8)) return false;
       const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
