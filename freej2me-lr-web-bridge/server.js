@@ -1723,27 +1723,6 @@ function getPatchedIndexHtml() {
       border:1px solid rgba(255,255,255,.10);
       box-shadow:0 10px 36px rgba(0,0,0,.25);
     }
-    body.v16-game-active #screen-container {
-      position: fixed !important;
-      inset: 0 !important;
-      width: 100vw !important;
-      height: 100vh !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      background: #000 !important;
-      z-index: 50 !important;
-      margin: 0 !important;
-      padding: 0 !important;
-    }
-    body.v16-game-active #canvas {
-      width: auto !important;
-      height: auto !important;
-      max-width: 100vw !important;
-      max-height: 100vh !important;
-      outline: none !important;
-      image-rendering: pixelated;
-    }
     @media (max-width:560px) { .v16-row { grid-template-columns:1fr; } #login-box.v16-card{padding:16px;} }
   </style>
   <div id="login-box" class="v16-card">
@@ -1816,7 +1795,6 @@ function getPatchedIndexHtml() {
     }
     function setGameUiVisible(show) {
       gameLoaded = !!show;
-      document.body.classList.toggle('v16-game-active', !!show);
       if (v11ControlsGuard) v11ControlsGuard.disabled = !!show;
       if (controlsEl) controlsEl.style.display = show ? 'grid' : 'none';
       if (show) { try { canvas.focus(); } catch(e) {} }
