@@ -35,12 +35,7 @@ export ADAPTIVE_LEVELS=${ADAPTIVE_LEVELS:-100}
 export ADAPTIVE_WINDOW_MS=${ADAPTIVE_WINDOW_MS:-1000}
 export ADAPTIVE_RECOVER_WINDOWS=${ADAPTIVE_RECOVER_WINDOWS:-3}
 
-if command -v ffmpeg >/dev/null 2>&1; then
-  export FFMPEG_PATH=${FFMPEG_PATH:-ffmpeg}
-  export AUDIO_CODEC=${AUDIO_CODEC:-opus}
-else
-  export AUDIO_CODEC=${AUDIO_CODEC:-pcm}
-fi
+export AUDIO_CODEC=${AUDIO_CODEC:-opus}
 
 if [ "$TRANSPORT_PROFILE" = "remote" ]; then
   export VIDEO_CODEC=${VIDEO_CODEC:-webp}

@@ -34,12 +34,7 @@ if "%ADAPTIVE_WINDOW_MS%"=="" set ADAPTIVE_WINDOW_MS=1000
 set ADAPTIVE_RECOVER_WINDOWS=%ADAPTIVE_RECOVER_WINDOWS%
 if "%ADAPTIVE_RECOVER_WINDOWS%"=="" set ADAPTIVE_RECOVER_WINDOWS=3
 
-if exist "%~dp0tools\ffmpeg.exe" (
-  if "%FFMPEG_PATH%"=="" set FFMPEG_PATH=%~dp0tools\ffmpeg.exe
-  if "%AUDIO_CODEC%"=="" set AUDIO_CODEC=opus
-) else (
-  if "%AUDIO_CODEC%"=="" set AUDIO_CODEC=pcm
-)
+if "%AUDIO_CODEC%"=="" set AUDIO_CODEC=opus
 
 if /I "%TRANSPORT_PROFILE%"=="remote" (
   set VIDEO_CODEC=%VIDEO_CODEC%
