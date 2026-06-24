@@ -21,6 +21,8 @@ const multer = require('multer');
 const http = require('http');
 const net = require('net');
 const WebSocket = require('ws');
+let OpusScript = null;
+try { OpusScript = require('opusscript'); } catch (e) { /* optional */ }
 let sharp = null;
 try { sharp = require('sharp'); } catch (e) { /* optional: VIDEO_CODEC=webp will fallback if missing */ }
 let helmet = null, cors = null, expressRateLimit = null, systeminformation = null;
@@ -190,7 +192,8 @@ function loadConfig() {
       audioStartBufferMs: 110,
       audioMinBufferMs: 70,
       audioMaxBufferMs: 260,
-      audioCodec: 'pcm',
+      audioCodec: 'opus',
+      opusBitrate: '96k',
       wsCompression: false,
     },
     balanced: {
@@ -204,7 +207,8 @@ function loadConfig() {
       audioStartBufferMs: 140,
       audioMinBufferMs: 90,
       audioMaxBufferMs: 320,
-      audioCodec: 'pcm',
+      audioCodec: 'opus',
+      opusBitrate: '80k',
       wsCompression: false,
     },
     remote: {
@@ -218,7 +222,8 @@ function loadConfig() {
       audioStartBufferMs: 180,
       audioMinBufferMs: 120,
       audioMaxBufferMs: 420,
-      audioCodec: 'pcm',
+      audioCodec: 'opus',
+      opusBitrate: '64k',
       wsCompression: false,
     },
   };
@@ -259,8 +264,9 @@ function loadConfig() {
     audioStartBufferMs: Math.max(40, Math.min(500, intConfig('AUDIO_START_BUFFER_MS', fileConfig.audioStartBufferMs, profile.audioStartBufferMs))),
     clientAudioMinBufferMs: Math.max(40, Math.min(500, intConfig('CLIENT_AUDIO_MIN_BUFFER_MS', fileConfig.clientAudioMinBufferMs, profile.audioMinBufferMs))),
     clientAudioMaxBufferMs: Math.max(80, Math.min(1000, intConfig('CLIENT_AUDIO_MAX_BUFFER_MS', fileConfig.clientAudioMaxBufferMs, profile.audioMaxBufferMs))),
-    // Audio: PCM over WebSocket only
+    // Opus over websocket via opusscript (no external ffmpeg dependency).
     audioCodec: String(process.env.AUDIO_CODEC || fileConfig.audioCodec || profile.audioCodec).toLowerCase(),
+    opusBitrate: String(process.env.OPUS_BITRATE || fileConfig.opusBitrate || profile.opusBitrate),
     adaptiveStreaming: boolConfig('ADAPTIVE_STREAMING', fileConfig.adaptiveStreaming, true),
     adaptiveLevels: Math.max(12, Math.min(100, intConfig('ADAPTIVE_LEVELS', fileConfig.adaptiveLevels, 100))),
     adaptiveWindowMs: Math.max(400, Math.min(5000, intConfig('ADAPTIVE_WINDOW_MS', fileConfig.adaptiveWindowMs, 1000))),
@@ -316,6 +322,14 @@ if (CONFIG.videoCodec === 'webp' && !sharp) {
   console.warn('[Video] VIDEO_CODEC=webp nhưng sharp chưa cài được. Fallback rgb565. Chạy: npm install sharp');
   CONFIG.videoCodec = 'rgb565';
 }
+function probeOpusScriptAvailability() {
+  if (!OpusScript) return { available: false, reason: 'module-missing' };
+  try {
+    return { available: true, reason: 'ok' };
+  } catch (e) {
+    return { available: false, reason: e.message || 'exception' };
+  }
+}
 function buildAdaptiveProfiles() {
   const count = CONFIG.adaptiveLevels;
   const profiles = [];
@@ -329,6 +343,7 @@ function buildAdaptiveProfiles() {
     const clientAudioMinBufferMs = clampNumber(Math.round(lerp(50, 150, t)), 40, 500);
     const clientAudioMaxBufferMs = clampNumber(Math.round(lerp(140, 420, t)), clientAudioMinBufferMs, 1000);
     const maxWsBufferedAmount = clampNumber(Math.round(lerp(1536 * 1024, 320 * 1024, t)), 128 * 1024, 2 * 1024 * 1024);
+    const opusKbps = clampNumber(Math.round(lerp(96, 32, t) / 4) * 4, 32, 128);
     profiles.push({
       level: i,
       label: `Q${quality}`,
@@ -338,7 +353,8 @@ function buildAdaptiveProfiles() {
       webpQuality: quality,
       streamScale: 1,
       maxFps,
-      audioCodec: 'pcm',
+      audioCodec: OPUS_PROBE.available ? 'opus' : 'pcm',
+      opusBitrate: `${opusKbps}k`,
       audioPacketMs,
       audioStartBufferMs,
       clientAudioMinBufferMs,
@@ -349,8 +365,11 @@ function buildAdaptiveProfiles() {
   }
   return profiles;
 }
+const OPUS_PROBE = probeOpusScriptAvailability();
 const ADAPTIVE_PROFILES = buildAdaptiveProfiles();
 const AUDIO_MAGIC = Buffer.from('FJ2A');
+const AUDIO_TYPE_OPUS_FORMAT = 3;
+const AUDIO_TYPE_OPUS_PACKET = 4;
 const SERVER_LOCK_PATH = path.join(CONFIG.dataDir, `server-${CONFIG.port}.lock.json`);
 let wss = null;
 let javaBackend = null;
@@ -871,8 +890,15 @@ class EmulatorSession {
     publicSessionIds.set(this.publicId, this);
     this.clients = new Set();
     this.audioHttpClients = new Set();
+    this.opusEncoder = null;
+    this.opusTargetRate = 48000;
+    this.opusPendingPcm = Buffer.alloc(0);
+    this.opusInputRate = 0;
+    this.opusChannels = 1;
+    this.opusFrameDurationMs = 20;
     this.profileLevel = 0;
     this.profile = ADAPTIVE_PROFILES[0] || null;
+    this.opusAudioEnabled = !!(this.profile && this.profile.audioCodec === 'opus' && OPUS_PROBE.available);
     this.isRunning = false;
     this.backendWs = null;
     this.backendConnected = false;
@@ -880,6 +906,7 @@ class EmulatorSession {
     this.backendReconnectTimer = null;
     this.frameRequestTimer = null;
     this.closing = false;
+    this.clientForcedAudioMode = null;
     this.desiredEncoding = 'ISO_8859_1';
     this.emuFrameWidth = CONFIG.width; this.emuFrameHeight = CONFIG.height;
     this.streamOutWidth = Math.floor(CONFIG.width / CONFIG.streamScale); this.streamOutHeight = Math.floor(CONFIG.height / CONFIG.streamScale);
@@ -934,10 +961,12 @@ class EmulatorSession {
     this.profileLevel = nextLevel;
     const visualChanged = this.maybeApplyVisualProfile(target, reason);
     this.profile = Object.assign({}, target, this.visualProfile ? { videoCodec: this.visualProfile.videoCodec, streamScale: this.visualProfile.streamScale } : {});
-    // PCM only - no opus
+    this.opusAudioEnabled = !!(this.profile && this.profile.audioCodec === 'opus' && OPUS_PROBE.available);
+    if (!this.opusAudioEnabled) this.stopOpusEncoder();
+    else if (this.currentAudioFormat) this.startOpusEncoder();
     if (this.isRunning) this.startFramePump();
     if (!prevProfile || prevProfile.level !== target.level || reason !== 'init' || visualChanged) {
-      console.log(`[ADAPT ${this.username}] ${reason} -> level=${target.level + 1}/${ADAPTIVE_PROFILES.length} video=${this.profile.videoCodec}@${this.profile.streamScale} targetVideo=${target.videoCodec}@${target.streamScale} fps=${this.profile.maxFps} audio=pcm`);
+      console.log(`[ADAPT ${this.username}] ${reason} -> level=${target.level + 1}/${ADAPTIVE_PROFILES.length} video=${this.profile.videoCodec}@${this.profile.streamScale} targetVideo=${target.videoCodec}@${target.streamScale} fps=${this.profile.maxFps} audio=${this.profile.audioCodec}${this.opusAudioEnabled ? ':' + this.profile.opusBitrate : ''}`);
       if (this.clients.size > 0) {
         this.broadcastConfig();
         this.broadcastJson(this.getAudioStatus({ event: 'adaptive-profile', adaptiveLevel: target.level, adaptiveCount: ADAPTIVE_PROFILES.length, visualChanged, videoCodec: this.profile.videoCodec, streamScale: this.profile.streamScale }));
@@ -1000,6 +1029,9 @@ class EmulatorSession {
 
   broadcast(data, opts = {}) { for (const ws of this.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data, opts); }
   broadcastJson(obj) { this.broadcast(JSON.stringify(obj)); }
+  shouldUseOpus() { return !!(this.opusAudioEnabled && this.clientForcedAudioMode !== 'pcm' && OPUS_PROBE.available); }
+  getAdvertisedAudioCodec() { return this.shouldUseOpus() ? 'opus' : 'pcm'; }
+  getCurrentAudioUrl() { return null; }
   makeAudioFormatPacketFromCurrent() {
     if (!this.currentAudioFormat) return null;
     const packet = Buffer.allocUnsafe(13);
@@ -1011,6 +1043,21 @@ class EmulatorSession {
     packet[11] = this.currentAudioFormat.signed ? 1 : 0;
     packet[12] = this.currentAudioFormat.bigEndian ? 1 : 0;
     return packet;
+  }
+  setClientAudioMode(mode = 'auto', reason = 'client') {
+    const normalized = String(mode || 'auto').toLowerCase() === 'pcm' ? 'pcm' : null;
+    const before = this.getAdvertisedAudioCodec();
+    this.clientForcedAudioMode = normalized;
+    const after = this.getAdvertisedAudioCodec();
+    if (before === after) return;
+    if (after === 'opus') {
+      if (this.currentAudioFormat) this.startOpusEncoder();
+    } else {
+      this.stopOpusEncoder();
+      const fmt = this.makeAudioFormatPacketFromCurrent();
+      if (fmt) this.broadcast(fmt, { binary: true, compress: false });
+    }
+    this.broadcastJson(this.getAudioStatus({ event: 'audio-mode', reason, audioCodec: after, audioUrl: this.getCurrentAudioUrl() }));
   }
   debugAdaptiveDrop(amount, reason = 'debug-drop') {
     const delta = Math.max(1, Math.abs(amount | 0));
@@ -1030,12 +1077,12 @@ class EmulatorSession {
       audioStartBufferMs: p.audioStartBufferMs,
       clientAudioMinBufferMs: p.clientAudioMinBufferMs,
       clientAudioMaxBufferMs: p.clientAudioMaxBufferMs,
-      audioCodec: 'pcm',
+      audioCodec: this.getAdvertisedAudioCodec(),
       adaptiveLevel: this.profileLevel,
       adaptiveCount: ADAPTIVE_PROFILES.length,
     };
   }
-  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, ...this.audioStats, ...this.getClientAudioTuning(), ...extra }; }
+  getAudioStatus(extra = {}) { return { type: 'audio-status', enabled: CONFIG.audioPipe, format: this.currentAudioFormat, opusScriptAvailable: OPUS_PROBE.available, ...this.audioStats, ...this.getClientAudioTuning(), ...extra }; }
   getStreamDimensions(width = this.emuFrameWidth, height = this.emuFrameHeight) {
     const scale = Math.max(1, (this.getCurrentProfile().streamScale || 1) | 0);
     return { width: Math.max(1, Math.floor(width / scale)), height: Math.max(1, Math.floor(height / scale)) };
@@ -1044,7 +1091,7 @@ class EmulatorSession {
     const p = this.getCurrentProfile();
     const d = this.getStreamDimensions();
     this.streamOutWidth = d.width; this.streamOutHeight = d.height;
-    this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ...this.getClientAudioTuning() });
+    this.broadcastJson({ type: 'config', width: d.width, height: d.height, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, opusScriptAvailable: OPUS_PROBE.available, ...this.getClientAudioTuning() });
   }
 
   cancelNoClientShutdown() {
@@ -1093,9 +1140,9 @@ class EmulatorSession {
     ws._emuSession = this;
     console.log(`[SESSION ${this.username}] client bound game=${this.gameHash} clients=${this.clients.size}`);
     const p = this.getCurrentProfile();
-    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioCodec: 'pcm' }));
+    ws.send(JSON.stringify({ type: 'auth', user: { id: this.userId, username: this.username }, gameHash: this.gameHash, sessionId: this.publicId, audioUrl: this.getCurrentAudioUrl(), audioCodec: this.getAdvertisedAudioCodec() }));
     ws.send(JSON.stringify({ type: 'status', state: this.isRunning ? 'running' : 'binding', gameHash: this.gameHash }));
-    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, ...this.getClientAudioTuning() }));
+    ws.send(JSON.stringify({ type: 'config', width: this.streamOutWidth, height: this.streamOutHeight, scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, opusScriptAvailable: OPUS_PROBE.available, ...this.getClientAudioTuning() }));
     ws.send(JSON.stringify(this.getAudioStatus({ event: 'connect' })));
     ws.on('close', () => {
       this.clients.delete(ws);
@@ -1180,7 +1227,120 @@ class EmulatorSession {
     return out;
   }
 
+  getOpusFrameDurationMs() {
+    const packetMs = this.getCurrentProfile().audioPacketMs || 20;
+    if (packetMs >= 50) return 60;
+    if (packetMs >= 30) return 40;
+    return 20;
+  }
 
+  makeAudioOpusFormatPacket() {
+    const f = this.currentAudioFormat || { channels: 1 };
+    const h = Buffer.allocUnsafe(13);
+    h.write('FJ2A', 0, 4, 'ascii');
+    h[4] = AUDIO_TYPE_OPUS_FORMAT;
+    h.writeUInt32BE(this.opusTargetRate, 5);
+    h[9] = f.channels || 1;
+    h[10] = 16;
+    h[11] = 1;
+    h[12] = 0;
+    return h;
+  }
+
+  makeAudioOpusPacket(payload) {
+    const h = Buffer.allocUnsafe(9);
+    h.write('FJ2A', 0, 4, 'ascii');
+    h[4] = AUDIO_TYPE_OPUS_PACKET;
+    h.writeUInt32BE(payload.length, 5);
+    return Buffer.concat([h, payload]);
+  }
+
+  pcmBufferToUint16ArrayLE(buffer) {
+    const samples = new Uint16Array(buffer.length >> 1);
+    for (let i = 0, j = 0; i < samples.length; i++, j += 2) samples[i] = buffer.readUInt16LE(j);
+    return samples;
+  }
+
+  resamplePcmS16LE(buffer, channels, inputRate, outputRate, outputSamplesPerChannel) {
+    if (inputRate === outputRate) return Buffer.from(buffer);
+    const inputSamplesPerChannel = Math.floor(buffer.length / (channels * 2));
+    const out = Buffer.allocUnsafe(outputSamplesPerChannel * channels * 2);
+    for (let ch = 0; ch < channels; ch++) {
+      for (let i = 0; i < outputSamplesPerChannel; i++) {
+        const srcPos = (i * inputRate) / outputRate;
+        const idx0 = Math.min(inputSamplesPerChannel - 1, Math.floor(srcPos));
+        const idx1 = Math.min(inputSamplesPerChannel - 1, idx0 + 1);
+        const frac = srcPos - idx0;
+        const s0 = buffer.readInt16LE((idx0 * channels + ch) * 2);
+        const s1 = buffer.readInt16LE((idx1 * channels + ch) * 2);
+        const mixed = Math.max(-32768, Math.min(32767, Math.round(s0 + (s1 - s0) * frac)));
+        out.writeInt16LE(mixed, (i * channels + ch) * 2);
+      }
+    }
+    return out;
+  }
+
+  startOpusEncoder() {
+    const p = this.getCurrentProfile();
+    if (!OPUS_PROBE.available || !this.shouldUseOpus() || !this.currentAudioFormat || this.opusEncoder) return;
+    const f = this.currentAudioFormat;
+    if (f.bits !== 16 || !f.signed) {
+      console.warn(`[AUDIO ${this.username}] Opus fallback: unsupported PCM format`, f);
+      this.opusAudioEnabled = false;
+      return;
+    }
+    try {
+      this.opusChannels = Math.max(1, f.channels || 1);
+      this.opusInputRate = f.sampleRate || 44100;
+      this.opusFrameDurationMs = this.getOpusFrameDurationMs();
+      this.opusPendingPcm = Buffer.alloc(0);
+      this.opusEncoder = new OpusScript(this.opusTargetRate, this.opusChannels, OpusScript.Application.AUDIO);
+      this.opusEncoder.setBitrate(parseInt(String(p.opusBitrate).replace(/k$/i, ''), 10) * 1000 || 96000);
+      console.log(`[AUDIO ${this.username}] starting opusscript opus ${p.opusBitrate}: rate=${this.opusTargetRate} ch=${this.opusChannels} frame=${this.opusFrameDurationMs}ms`);
+    } catch (e) {
+      console.warn(`[AUDIO ${this.username}] opusscript init failed: ${e.message}; fallback PCM websocket`);
+      this.opusAudioEnabled = false;
+      this.opusEncoder = null;
+    }
+  }
+
+  encodePendingOpusFrames() {
+    if (!this.opusEncoder || !this.currentAudioFormat) return;
+    const inRate = this.opusInputRate || this.currentAudioFormat.sampleRate || 44100;
+    const channels = this.opusChannels || 1;
+    const outSamples = Math.round(this.opusTargetRate * this.opusFrameDurationMs / 1000);
+    const inSamples = Math.max(1, Math.round(inRate * this.opusFrameDurationMs / 1000));
+    const inBytes = inSamples * channels * 2;
+    while (this.opusPendingPcm.length >= inBytes) {
+      const chunk = this.opusPendingPcm.slice(0, inBytes);
+      this.opusPendingPcm = this.opusPendingPcm.slice(inBytes);
+      const pcm = this.resamplePcmS16LE(chunk, channels, inRate, this.opusTargetRate, outSamples);
+      const pcm16 = this.pcmBufferToUint16ArrayLE(pcm);
+      const encoded = Buffer.from(this.opusEncoder.encode(pcm16, outSamples));
+      this.broadcast(this.makeAudioOpusPacket(encoded), { binary: true, compress: false });
+    }
+  }
+
+  writeOpusPcm(payload) {
+    if (!this.shouldUseOpus()) return false;
+    this.startOpusEncoder();
+    if (!this.opusEncoder) return false;
+    this.opusPendingPcm = Buffer.concat([this.opusPendingPcm, Buffer.from(payload)]);
+    this.encodePendingOpusFrames();
+    return true;
+  }
+
+  addAudioHttpClient(res) {
+    return false;
+  }
+
+  stopOpusEncoder() {
+    if (this.opusEncoder) {
+      try { this.opusEncoder.delete(); } catch (e) {}
+    }
+    this.opusEncoder = null;
+    this.opusPendingPcm = Buffer.alloc(0);
+  }
 
   makeAudioPcmPacket(payload) {
     const h = Buffer.allocUnsafe(9);
@@ -1396,9 +1556,12 @@ class EmulatorSession {
       this.currentAudioFormat = { sampleRate: packet.readUInt32BE(5), channels: packet[9], bits: packet[10], signed: packet[11] !== 0, bigEndian: packet[12] !== 0 };
       this.audioStats.formatPackets++; this.audioStats.lastFormatAt = now();
       this.flushAudioPcm();
+      this.stopOpusEncoder();
+      this.opusAudioEnabled = !!(this.getCurrentProfile().audioCodec === 'opus' && OPUS_PROBE.available);
       console.log(`[AUDIO ${this.username}] Format:`, this.currentAudioFormat);
-      this.broadcast(packet, { binary: true, compress: false });
-      this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: 'pcm' }));
+      if (!this.shouldUseOpus()) this.broadcast(packet, { binary: true, compress: false });
+      this.broadcastJson(this.getAudioStatus({ event: 'format', audioCodec: this.getAdvertisedAudioCodec(), audioUrl: this.getCurrentAudioUrl() }));
+      if (this.shouldUseOpus()) this.startOpusEncoder();
       return;
     }
     if (type === 2) {
@@ -1407,8 +1570,8 @@ class EmulatorSession {
       if (len > 1024 * 1024 || 9 + len > packet.length) return;
       const payload = Buffer.from(packet.slice(9, 9 + len));
       this.audioStats.pcmPackets++; this.audioStats.pcmBytes += len; this.audioStats.lastPcmAt = now();
-      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=pcm, coalesce=${this.getCurrentProfile().audioPacketMs}ms`);
-      this.queueAudioPcm(payload);
+      if (this.audioStats.pcmPackets === 1 || this.audioStats.pcmPackets % 1000 === 0) console.log(`[AUDIO ${this.username}] PCM packets=${this.audioStats.pcmPackets}, bytes=${this.audioStats.pcmBytes}, codec=${this.getAdvertisedAudioCodec()}, coalesce=${this.getCurrentProfile().audioPacketMs}ms`);
+      if (!this.writeOpusPcm(payload)) this.queueAudioPcm(payload);
     }
   }
 
@@ -1462,6 +1625,7 @@ class EmulatorSession {
     this.cancelNoClientShutdown();
     if (this.inputIdleTimer) { clearInterval(this.inputIdleTimer); this.inputIdleTimer = null; }
     this.flushAudioPcm();
+    this.stopOpusEncoder();
     if (this.audioFlushTimer) { clearTimeout(this.audioFlushTimer); this.audioFlushTimer = null; }
     await this.closeBackendConnection(reason);
     if (javaBackend) javaBackend.unregisterSession(this);
@@ -1599,7 +1763,7 @@ function getPatchedIndexHtml() {
     </div>
     <div class="v16-hint">Mỗi tài khoản có save riêng theo từng game. Bạn có thể upload JAR sau khi đăng nhập.</div>
   </div>`;
-  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <div id="adaptive-debug" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:12px;background:#18222d;color:#cfe3ff;font:12px/1.4 monospace"></div>\n  <div id="adaptive-buttons" style="display:none;gap:6px;flex-wrap:wrap;margin:0 0 10px"></div>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
+  html = html.replace('<div id="status" class="connecting">Đang kết nối...</div>', '<script src="/opusscript.bundle.js"></script>\n<div id="status" class="connecting">Đang kết nối...</div>\n' + loginBox + '\n  <button id="audio-toggle" style="margin:0 0 10px;padding:8px 14px;border:0;border-radius:18px;background:#333;color:#fff;cursor:pointer;display:none">🔇 Bật âm thanh</button>\n  <div id="adaptive-debug" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:12px;background:#18222d;color:#cfe3ff;font:12px/1.4 monospace"></div>\n  <div id="adaptive-buttons" style="display:none;gap:6px;flex-wrap:wrap;margin:0 0 10px"></div>\n  <style id="v11-controls-guard">#controls{display:none !important;}</style>\n  <style id="v12-login-first">#upload-area,#screen-container,#controls,#help{display:none !important;}</style>');
 
   const patchedKeyMap = `const keyMap = {
       'w': 0, 'W': 0, 's': 1, 'S': 1, 'a': 2, 'A': 2, 'd': 3, 'D': 3,
@@ -1686,12 +1850,18 @@ function getPatchedIndexHtml() {
 
     let audioCtx = null, audioUnlocked = false, audioMuted = false, audioNextTime = 0;
     let audioFormat = { sampleRate: 48000, channels: 2, bits: 16, signed: true, bigEndian: false };
+    let opusAudioUrl = null;
+    let opusAudioEl = null;
+    let opusDecoder = null;
+    let opusSampleRate = 48000;
+    let opusChannels = 1;
     let videoCodec = 'rgba';
     let imageQuality = 100;
     let transportProfile = 'local';
     let audioAdaptiveBuffer = true;
     let adaptiveLevel = 0, adaptiveCount = 1;
-    let audioCodecMode = 'pcm'; // forced PCM, no opus
+    let audioCodecMode = 'pcm';
+    let opusScriptAvailable = false;
     let audioPacketMs = 40;
     let audioStartBufferSec = 0.11;
     let audioMinBufferSec = 0.07;
@@ -1735,6 +1905,7 @@ function getPatchedIndexHtml() {
       audioAdaptiveBuffer = msg.audioAdaptiveBuffer !== false;
       adaptiveLevel = (msg.adaptiveLevel ?? adaptiveLevel) | 0;
       adaptiveCount = Math.max(1, (msg.adaptiveCount ?? adaptiveCount) | 0);
+      opusScriptAvailable = !!msg.opusScriptAvailable;
       audioCodecMode = msg.audioCodec || audioCodecMode || 'pcm';
       audioPacketMs = Math.max(10, Math.min(120, msg.audioPacketMs || audioPacketMs || 40));
       audioStartBufferSec = clamp((msg.audioStartBufferMs || (transportProfile === 'remote' ? 180 : 110)) / 1000, 0.04, 0.50);
@@ -1743,21 +1914,51 @@ function getPatchedIndexHtml() {
       audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec);
     }
     function resetAudioScheduler(){ if(audioCtx) audioNextTime = audioCtx.currentTime + audioTargetBufferSec; }
+    let opusProbeTimer = null, opusPlayingConfirmed = false;
+    function clearOpusProbe(){ if(opusProbeTimer){ clearTimeout(opusProbeTimer); opusProbeTimer = null; } }
+    function requestPcmFallback(reason){ if(audioCodecMode !== 'opus') return; console.warn('Opus fallback -> PCM:', reason); audioCodecMode = 'pcm'; opusAudioUrl = null; stopOpusAudio(); sendAudioMode('pcm', reason); refreshAudioButtonTitle('fallback-pcm ' + reason); }
+    function attachOpusEvents(){
+      if(!opusAudioEl || opusAudioEl._fj2meEventsAttached) return;
+      opusAudioEl._fj2meEventsAttached = true;
+      const good = () => { opusPlayingConfirmed = true; clearOpusProbe(); refreshAudioButtonTitle('opus-playing'); };
+      const bad = (ev) => { if(audioCodecMode === 'opus') requestPcmFallback('opus-' + ev.type); };
+      ['playing','canplay','timeupdate'].forEach(name => opusAudioEl.addEventListener(name, good));
+      ['error','stalled','abort','emptied'].forEach(name => opusAudioEl.addEventListener(name, bad));
+    }
+    function stopOpusDecoder(){ if(opusDecoder && opusDecoder.delete){ try{ opusDecoder.delete(); }catch(e){} } opusDecoder = null; }
+    function ensureOpusDecoder(){
+      if(audioCodecMode !== 'opus') return null;
+      if(typeof window.OpusScript === 'undefined') return null;
+      if(opusDecoder && opusDecoder._fjRate === opusSampleRate && opusDecoder._fjChannels === opusChannels) return opusDecoder;
+      stopOpusDecoder();
+      try {
+        opusDecoder = new window.OpusScript(opusSampleRate, opusChannels, window.OpusScript.Application.AUDIO);
+        opusDecoder._fjRate = opusSampleRate;
+        opusDecoder._fjChannels = opusChannels;
+        return opusDecoder;
+      } catch(e) {
+        console.warn('Opus decoder init failed:', e);
+        return null;
+      }
+    }
+    function stopOpusAudio(){ clearOpusProbe(); opusPlayingConfirmed = false; stopOpusDecoder(); if(opusAudioEl){ try{ opusAudioEl.pause(); }catch(e){} try{ opusAudioEl.removeAttribute('src'); opusAudioEl.load(); }catch(e){} } }
     function updateAdaptiveDebug(extra){
       if(!adaptiveDebugEl) return;
-      const codec = 'pcm';
+      const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
       adaptiveDebugEl.textContent = 'Adaptive level ' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' | video=' + videoCodec + ' q=' + imageQuality + ' | audio=' + codec + ' | packet=' + audioPacketMs + 'ms | drop=' + audioDroppedPackets + ' | underrun=' + audioUnderruns + (extra ? ' | ' + extra : '');
     }
     function refreshAudioButtonTitle(extra){
       const state = audioUnlocked && !audioMuted ? '🔊 Âm thanh: bật' : '🔇 Bật âm thanh';
-      const title = 'codec=pcm profile=' + transportProfile + ' ladder=' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
+      const codec = audioCodecMode || (opusAudioUrl ? 'opus' : 'pcm');
+      const title = 'codec=' + codec + ' opusScript=' + (opusScriptAvailable ? 'on' : 'off') + ' profile=' + transportProfile + ' ladder=' + (adaptiveLevel + 1) + '/' + adaptiveCount + ' target=' + Math.round(audioTargetBufferSec*1000) + 'ms min=' + Math.round(audioMinBufferSec*1000) + 'ms max=' + Math.round(audioMaxBufferSec*1000) + 'ms packet=' + audioPacketMs + 'ms underrun=' + audioUnderruns + ' drop=' + audioDroppedPackets + (extra ? ' ' + extra : '');
       setAudioButton(state, title);
       updateAdaptiveDebug(extra || 'ready');
     }
-    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); }
-    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); } refreshAudioButtonTitle(); } };
+    function startOpusAudio(){ if(audioCodecMode !== 'opus') return; const dec = ensureOpusDecoder(); if(!dec){ requestPcmFallback('opus-decoder'); return; } opusPlayingConfirmed = true; clearOpusProbe(); refreshAudioButtonTitle('opus-decoder-ready'); }
+    function unlockAudio(){ const ctx=ensureAudioContext(); ctx.resume(); audioUnlocked=true; audioMuted=false; audioTargetBufferSec = clamp(audioTargetBufferSec || audioStartBufferSec, audioMinBufferSec, audioMaxBufferSec); audioNextTime=ctx.currentTime+audioTargetBufferSec; refreshAudioButtonTitle(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); }
+    audioToggle.onclick = () => { if(!audioUnlocked) unlockAudio(); else { audioMuted=!audioMuted; if(opusAudioEl) opusAudioEl.muted = audioMuted; if(!audioMuted){ resetAudioScheduler(); browserTestBeep(); if(audioCodecMode === 'opus') startOpusAudio(); } refreshAudioButtonTitle(); } };
     function isAudioPacket(u8){ return u8 && u8.length>=5 && u8[0]===0x46 && u8[1]===0x4A && u8[2]===0x32 && u8[3]===0x41; }
-    function handleAudioStatus(msg){ applyAudioTuning(msg); if(msg.event === 'adaptive-profile'){ console.log('[adaptive]', msg.adaptiveLevel + 1, '/', msg.adaptiveCount, msg); setStatus('Adaptive level ' + (msg.adaptiveLevel + 1) + '/' + msg.adaptiveCount + ' | ' + videoCodec + ' | pcm', 'connected'); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
+    function handleAudioStatus(msg){ applyAudioTuning(msg); if(audioCodecMode === 'opus'){ if(audioUnlocked && !audioMuted) startOpusAudio(); } else { opusAudioUrl = null; stopOpusAudio(); } if(msg.event === 'adaptive-profile'){ console.log('[adaptive]', msg.adaptiveLevel + 1, '/', msg.adaptiveCount, msg); setStatus('Adaptive level ' + (msg.adaptiveLevel + 1) + '/' + msg.adaptiveCount + ' | ' + videoCodec + ' | ' + audioCodecMode, 'connected'); } refreshAudioButtonTitle('fmt='+(msg.formatPackets||0)+' pcm='+(msg.pcmPackets||0)); }
     function scheduleDecodedPcm(sampleRate, channels, pcmBytes){
       if(!audioUnlocked || audioMuted || !audioCtx || !pcmBytes || pcmBytes.length < 2) return true;
       const chs=Math.max(1, channels|0), frames=Math.floor(pcmBytes.length/(2*chs)); if(frames<=0) return true;
@@ -1790,7 +1991,56 @@ function getPatchedIndexHtml() {
       if(!isAudioPacket(u8)) return false;
       const type=u8[4]; const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
       if(type===1 && u8.length>=13){ audioFormat={sampleRate:dv.getUint32(5,false),channels:u8[9]||1,bits:u8[10]||16,signed:u8[11]!==0,bigEndian:u8[12]!==0}; if(audioCtx) resetAudioScheduler(); refreshAudioButtonTitle('format'); return true; }
-      if(type===4) return true; // opus packet discarded
+      if(type===3 && u8.length>=13){ opusSampleRate=dv.getUint32(5,false)||48000; opusChannels=u8[9]||1; if(audioCtx) resetAudioScheduler(); if(audioUnlocked && !audioMuted) startOpusAudio(); refreshAudioButtonTitle('opus-format'); return true; }
+      if(type===4){
+        const len=dv.getUint32(5,false);
+        if(len<=0||9+len>u8.length||audioCodecMode!=='opus') return true;
+        const dec = ensureOpusDecoder();
+        if(!dec){ requestPcmFallback('opus-decoder-missing'); return true; }
+        try {
+          const decoded = dec.decode(u8.slice(9,9+len));
+          return scheduleDecodedPcm(opusSampleRate, opusChannels, decoded);
+        } catch(e) {
+          console.warn('Opus decode failed:', e);
+          requestPcmFallback('opus-decode');
+          return true;
+        }
+      }
+      if(type!==2 || u8.length<9) return true;
+      const len=dv.getUint32(5,false);
+      if(len<=0||9+len>u8.length||audioFormat.bits!==16) return true;
+      return scheduleDecodedPcm(audioFormat.sampleRate||48000, Math.max(1,audioFormat.channels|0), u8.slice(9,9+len));
+    }
+
+    // PERF: render latest frame only, reuse ImageData through replacement drawFrame below.
+    let latestFrame = null, rafPending = false, reusableImageData = null;
+    async function drawWebpFrame(src) {
+      const blob = new Blob([src], { type: 'image/webp' });
+      const bitmap = await createImageBitmap(blob);
+      ctx.drawImage(bitmap, 0, 0, screenWidth, screenHeight);
+      bitmap.close && bitmap.close();
+      return true;
+    }
+    function decodeVideoFrameToImageData(src, imageData) {
+      const dst = imageData.data;
+      const pixels = screenWidth * screenHeight;
+      let codec = videoCodec;
+      if (codec !== 'webp') {
+        if (src.length >= pixels * 4) codec = 'rgba';
+        else if (src.length >= pixels * 2) codec = 'rgb565';
+        else if (src.length >= pixels) codec = 'rgb332';
+      }
+      if (codec === 'rgb332') {
+        if (src.length < pixels) return false;
+        for (let i = 0, j = 0; i < pixels; i++, j += 4) {
+          const v = src[i];
+          dst[j] = Math.round(((v >> 5) & 7) * 255 / 7);
+          dst[j + 1] = Math.round(((v >> 2) & 7) * 255 / 7);
+          dst[j + 2] = Math.round((v & 3) * 255 / 3);
+          dst[j + 3] = 255;
+        }
+        return true;
+      }
       if (codec === 'rgb565') {
         if (src.length < pixels * 2) return false;
         for (let i = 0, k = 0, j = 0; i < pixels; i++, k += 2, j += 4) {
@@ -1831,7 +2081,7 @@ function getPatchedIndexHtml() {
   html = html.replace('    function connect() {', '    function connect() {\n      if (!shouldConnectWs) return;\n      if (wsConnecting) return;\n      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;\n      wsConnecting = true;');
   html = html.replace('        setTimeout(connect, 2000);', '        if (shouldConnectWs) setTimeout(connect, 2000);');
   html = html.replace('    connect();', '    // V24: connect() được gọi sau khi đăng nhập thành công; không tự connect ở màn hình login.');
-  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n              // audio via PCM WebSocket\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
+  html = html.replace("setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          }", "setStatus(`Đã kết nối - ${screenWidth}x${screenHeight}`, 'connected');\n          } else if (msg.type === 'audio-status') {\n            handleAudioStatus(msg);\n          } else if (msg.type === 'auth') {\n            if (msg.noGame) {\n              setLoggedInUi(true);\n              setGameUiVisible(false);\n              setStatus('Đã đăng nhập - hãy upload game', 'connected');\n            } else if (msg.gameHash) {\n              setLoggedInUi(true);\n              setGameUiVisible(true);\n              if (msg.audioUrl) { opusAudioUrl = msg.audioUrl; if (audioUnlocked && !audioMuted) startOpusAudio(); }\n            }\n          } else if (msg.type === 'status') {\n            if (msg.state === 'loading') {\n              setGameUiVisible(false);\n              setStatus('Đang tải game mới...', 'connecting');\n              try { ctx.clearRect(0, 0, canvas.width, canvas.height); latestFrame = null; } catch(e) {}\n            } else if (msg.state === 'running') {\n              setLoggedInUi(true);\n            } else if (msg.state === 'no-video-yet') {\n              setStatus('Game đang chạy nhưng chưa có hình - thử VIDEO_CODEC=rgba hoặc xem log server', 'error');\n            }\n          }");
   // V24: ẩn bàn phím ảo trong lúc chưa tải game / đang upload.
   html = html.replace(
     "uploadStatus.textContent = 'Đang upload...';",
@@ -1920,13 +2170,21 @@ function startWebServer() {
     } catch (e) { if (req.file && req.file.path) removePathSafe(req.file.path); console.error('[Upload]', e); res.status(500).json({ error: e.message }); }
   });
 
+  app.get('/audio/:id.webm', (req, res) => {
+    const sess = publicSessionIds.get(req.params.id);
+    if (!sess || !sess.isRunning || !sess.shouldUseOpus()) {
+      res.status(404).end('audio stream not found');
+      return;
+    }
+    sess.addAudioHttpClient(res);
+  });
 
   app.get(['/', '/index.html'], (req, res) => { try { res.type('html').send(getPatchedIndexHtml()); } catch (e) { console.error('[Web]', e); res.sendFile(path.join(__dirname, 'public', 'index.html')); } });
   app.use(express.static(path.join(__dirname, 'public')));
 
   const server = http.createServer(app);
   wss = new WebSocket.Server({ server, perMessageDeflate: CONFIG.wsCompression ? { zlibDeflateOptions: { level: 1, memLevel: 7 }, clientNoContextTakeover: true, serverNoContextTakeover: true, threshold: 1024 } : false });
-  console.log(`[Stream] mode=single-java profile=${CONFIG.transportProfile}, adaptiveStreaming=${CONFIG.adaptiveStreaming ? 'on' : 'off'}, adaptiveLevels=${ADAPTIVE_PROFILES.length}, adaptiveWindowMs=${CONFIG.adaptiveWindowMs}, recoverWindows=${CONFIG.adaptiveRecoverWindows}, startCodec=${ADAPTIVE_PROFILES[0].videoCodec}/${ADAPTIVE_PROFILES[0].audioCodec}, endCodec=${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].videoCodec}/${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].audioCodec}, sharp=${sharp ? 'on' : 'off'}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
+  console.log(`[Stream] mode=single-java profile=${CONFIG.transportProfile}, adaptiveStreaming=${CONFIG.adaptiveStreaming ? 'on' : 'off'}, adaptiveLevels=${ADAPTIVE_PROFILES.length}, adaptiveWindowMs=${CONFIG.adaptiveWindowMs}, recoverWindows=${CONFIG.adaptiveRecoverWindows}, startCodec=${ADAPTIVE_PROFILES[0].videoCodec}/${ADAPTIVE_PROFILES[0].audioCodec}, endCodec=${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].videoCodec}/${ADAPTIVE_PROFILES[ADAPTIVE_PROFILES.length - 1].audioCodec}, sharp=${sharp ? 'on' : 'off'}, opusScript=${OPUS_PROBE.available ? 'on' : 'off:' + OPUS_PROBE.reason}, audioPipe=${CONFIG.audioPipe ? 'on' : 'off'}, maxBuffered=${CONFIG.maxWsBufferedAmount}, noClientShutdownMs=${CONFIG.noClientShutdownMs}, inputIdleShutdownMs=${CONFIG.inputIdleShutdownMs}, sessionPolicy=${CONFIG.sessionPolicy}, queue=${CONFIG.startConcurrency}/${CONFIG.queueMaxSize}, maxUploadMb=${CONFIG.maxUploadMb}, maxUserStorageMb=${CONFIG.maxUserStorageMb}`);
   console.log(`[Auth] JSON DB: ${CONFIG.dbPath}`);
   console.log(`[Runtime] java=${CONFIG.javaPath}`);
   console.log(`[Runtime] sharedJar=${CONFIG.freej2meJar}`);
@@ -1940,7 +2198,7 @@ function startWebServer() {
     if (!sess) {
       const p = ADAPTIVE_PROFILES[0] || { streamScale: CONFIG.streamScale, videoCodec: CONFIG.videoCodec, imageQuality: CONFIG.imageQuality, webpQuality: CONFIG.webpQuality, audioPacketMs: CONFIG.audioPacketMs, audioStartBufferMs: CONFIG.audioStartBufferMs, clientAudioMinBufferMs: CONFIG.clientAudioMinBufferMs, clientAudioMaxBufferMs: CONFIG.clientAudioMaxBufferMs, audioCodec: CONFIG.audioCodec };
       ws.send(JSON.stringify({ type: 'auth', user: db.publicUser(user), noGame: true }));
-      ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / p.streamScale), height: Math.floor(CONFIG.height / p.streamScale), scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, transportProfile: CONFIG.transportProfile, audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer, adaptiveLevel: 0, adaptiveCount: ADAPTIVE_PROFILES.length, audioPacketMs: p.audioPacketMs, audioStartBufferMs: p.audioStartBufferMs, clientAudioMinBufferMs: p.clientAudioMinBufferMs, clientAudioMaxBufferMs: p.clientAudioMaxBufferMs, audioCodec: p.audioCodec }));
+      ws.send(JSON.stringify({ type: 'config', width: Math.floor(CONFIG.width / p.streamScale), height: Math.floor(CONFIG.height / p.streamScale), scale: p.streamScale, videoCodec: p.videoCodec, imageQuality: p.imageQuality, webpQuality: p.webpQuality, opusScriptAvailable: OPUS_PROBE.available, transportProfile: CONFIG.transportProfile, audioAdaptiveBuffer: CONFIG.audioAdaptiveBuffer, adaptiveLevel: 0, adaptiveCount: ADAPTIVE_PROFILES.length, audioPacketMs: p.audioPacketMs, audioStartBufferMs: p.audioStartBufferMs, clientAudioMinBufferMs: p.clientAudioMinBufferMs, clientAudioMaxBufferMs: p.clientAudioMaxBufferMs, audioCodec: p.audioCodec }));
     }
     else sess.addClient(ws);
     ws.on('message', msg => {
@@ -1950,7 +2208,7 @@ function startWebServer() {
         if (data.type === 'key' || data.type === 'touch') s.markInputActivity();
         if (data.type === 'key') { if (data.state === 'D') s.sendKeyDown(data.key); else if (data.state === 'U') s.sendKeyUp(data.key); }
         else if (data.type === 'touch') { let cmd = data.state === 'D' ? 5 : data.state === 'U' ? 4 : data.state === 'M' ? 6 : 0; if (cmd) { const scale = Math.max(1, ((s.getCurrentProfile ? s.getCurrentProfile().streamScale : CONFIG.streamScale) || 1) | 0); const x = data.x < 0 ? data.x : Math.max(0, Math.min(s.emuFrameWidth - 1, Math.floor(data.x * scale))); const y = data.y < 0 ? data.y : Math.max(0, Math.min(s.emuFrameHeight - 1, Math.floor(data.y * scale))); s.sendMouse(cmd, x, y); } }
-        else if (data.type === 'audioMode') { /* PCM only, no-op */ }
+        else if (data.type === 'audioMode') { s.setClientAudioMode(data.mode, data.reason || 'client'); }
         else if (data.type === 'debugAdaptive') {
           if (String(data.mode || '') === 'reset') s.debugAdaptiveReset('debug-reset');
           else s.debugAdaptiveDrop(parseInt(data.amount || 1, 10) || 1, 'debug-drop');

@@ -152,5 +152,3 @@ package-lock.json
 package.json
 freej2me-plus/rms/
 .gitignore
-freej2me-lr-web-bridge/GAME/
-freej2me-lr-web-bridge/ICON/
