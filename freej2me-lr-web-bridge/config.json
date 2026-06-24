@@ -1,7 +1,7 @@
 {
   "comment": "Cấu hình đường dẫn cho freej2me-lr-web-bridge. Có thể dùng đường dẫn tuyệt đối hoặc tương đối (tính từ thư mục project).",
 
-  "javaPath": "../jdk8u492-b09-jre/bin/java.exe",
+  "javaPath": "../jdk8u492-b09/jre/bin/java.exe",
   "freej2meJar": "../freej2me-plus",
   "defaultGameJar": null,
 
